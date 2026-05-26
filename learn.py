@@ -40,11 +40,16 @@ class ApplyTransform(Dataset):
     def __init__(self, subset, transform=None):
         self.subset = subset
         self.transform = transform
+        # explicitly force resize to 224x224 for standard resnet/deit inputs
+        self.resize = transforms.Resize((224, 224))
 
     def __getitem__(self, idx):
         # some datasets return (image, label, domain), others just (image, label)
         data = self.subset[idx]
         image = data[0]
+
+        # force resize to 224 before any other transforms
+        image = self.resize(image)
         
         if self.transform:
             image = self.transform(image)

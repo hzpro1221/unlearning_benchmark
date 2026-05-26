@@ -1,13 +1,13 @@
 dataset: "pacs"
 data_dir: "./dataset/data_folder/pacs"
 
-model_name: "resnet18"
+model_name: "deit_base_patch16_224"
 pretrained: true
 
 unlearn_setting: "random"
-forget_ratio: 0.40  
+forget_ratio: 0.10  
 
-epochs: 40
+epochs: 200
 batch_size: 32
-lr: 0.001
+lr: 3e-4
 seed: 42
