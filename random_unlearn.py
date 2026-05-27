@@ -15,6 +15,7 @@ from dataset.pytorch_dataset.cifar100 import CIFAR100Dataset
 from dataset.pytorch_dataset.officehome import OfficeHomeDataset
 from dataset.pytorch_dataset.pacs import PACSDataset
 from dataset.pytorch_dataset.tiny_imagenet import TinyImageNetDataset
+import torchvision.transforms as transforms
 
 # import transforms
 from dataset.transform.forget_test_transform import get_forget_test_transform
@@ -27,6 +28,7 @@ from dataset.transform.unseen_transform import get_unseen_transform
 # import architectures
 from architecture.deity import DeiTArchitecture
 from architecture.resnet import ResNetArchitecture
+from architecture.moe_deit import MoEDeiTArchitecture
 
 # import metrics
 from metric.fa import forget_acc
@@ -39,6 +41,7 @@ from approx_algo.boundary_shrink import boundary_shrink
 from approx_algo.gradient_ascent import gradient_ascent
 from approx_algo.l1_sparse import l1_sparse
 from approx_algo.random_labeling import random_labeling
+from approx_algo.module_unlearn_algo import ModularUnlearning
 
 class ApplyTransform(Dataset):
     """
@@ -103,19 +106,22 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"[*] using device: {device}")
     
-    # 3. initialize wandb
-    print("[*] initializing wandb...")
-    wandb.login(key="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")
-    
     unlearn_algo = getattr(args, 'unlearn_algo', 'finetune')
-    run_name = f"unlearn_{unlearn_algo}_{yaml_filename}"
-    
-    wandb.init(
-        project='random_unlearn',
-        name=run_name,
-        config=yaml_config, 
-        settings=wandb.Settings(start_method='thread')
-    )
+    use_wandb = getattr(args, 'use_wandb', True)
+
+    # 3. initialize wandb (skipped when use_wandb: false in config)
+    if use_wandb:
+        print("[*] initializing wandb...")
+        wandb.login(key="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")
+        run_name = f"unlearn_{unlearn_algo}_{yaml_filename}"
+        wandb.init(
+            project='random_unlearn',
+            name=run_name,
+            config=yaml_config,
+            settings=wandb.Settings(start_method='thread')
+        )
+    else:
+        print("[*] wandb disabled (use_wandb: false)")
 
     # 4. load the raw dataset
     print(f"[*] loading dataset: {args.dataset}")
@@ -177,9 +183,18 @@ def main():
     unseen_loader = DataLoader(unseen_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # 9. initialize architecture dynamically
-    print(f"[*] initializing model: {args.model_name}")
+    use_moe = getattr(args, 'use_moe', False)
+    print(f"[*] initializing model: {args.model_name}{' (MoE)' if use_moe else ''}")
     if 'resnet' in args.model_name:
         model = ResNetArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=False, device=device)
+    elif 'deit' in args.model_name and use_moe:
+        model = MoEDeiTArchitecture(
+            model_name=args.model_name,
+            num_classes=num_classes,
+            num_experts=getattr(args, 'num_experts', 4),
+            pretrained=False,
+            device=device,
+        )
     elif 'deit' in args.model_name:
         model = DeiTArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=False, device=device)
     else:
@@ -201,8 +216,32 @@ def main():
     
     print(f"[*] starting unlearning phase using algorithm: {unlearn_algo.upper()}")
     print(f"[*] early stopping condition: stop when fa <= {fa_threshold*100:.2f}%")
-    
+
     total_unlearn_time = 0.0
+
+    # ------------------------------------------------------------------
+    # modular_unlearn — Phase 1: setup (runs once before the epoch loop)
+    # ------------------------------------------------------------------
+    _modular_unlearner = None
+    _mia_converged = False          # set True when MIA ∈ [0.48, 0.52] mid-epoch
+    if unlearn_algo == 'modular_unlearn':
+        _modular_unlearner = ModularUnlearning(
+            model=model,
+            lr=args.lr,
+            beta=getattr(args, 'modular_beta', 1.0),
+            gamma=getattr(args, 'modular_gamma', 1.0),
+            lambda_div=getattr(args, 'modular_lambda_div', 0.0),
+            top_k=getattr(args, 'modular_top_k', None),
+            tau=getattr(args, 'modular_tau', None),
+            device=device,
+        )
+        info = _modular_unlearner.begin_modular_unlearn(forget_train_loader)
+        active_set = set(info['expert_indices'])
+        print(f"[*] modular unlearning: M_f = {info['expert_indices']} "
+              f"({len(active_set)} of {model.num_experts} experts activated)")
+        for m, s in enumerate(info['scores']):
+            marker = "  [ACTIVE]" if m in active_set else ""
+            print(f"        expert[{m}]: routing_mass={s:.4f}{marker}")
 
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
@@ -241,6 +280,37 @@ def main():
                 total_loss += loss.item()
             avg_loss = total_loss / len(retain_train_loader)
             
+        elif unlearn_algo == 'modular_unlearn':
+            # Phase 2: per-step updates interleaving forget and retain batches.
+            # eval_interval controls how often the MIA convergence check runs.
+            # When MIA settles in [0.48, 0.52] the model is statistically
+            # indistinguishable from a retrained model — we halt early.
+            steps = min(len(forget_train_loader), len(retain_train_loader))
+            eval_interval = getattr(args, 'modular_eval_interval', steps)
+
+            forget_iter = iter(forget_train_loader)
+            retain_iter = iter(retain_train_loader)
+            running_total = 0.0
+            completed_steps = 0
+
+            for step_idx in range(steps):
+                b_f = next(forget_iter)
+                b_r = next(retain_iter)
+                loss_dict = _modular_unlearner.update_modular_unlearn(b_f, b_r)
+                running_total += loss_dict["total"]
+                completed_steps += 1
+
+                # step-interval MIA convergence check
+                if (step_idx + 1) % eval_interval == 0:
+                    step_mia = mia(model, forget_eval_loader, unseen_loader, device)
+                    if 0.48 <= step_mia <= 0.52:
+                        print(f"  [!] mia converged at step {step_idx + 1}: "
+                              f"mia={step_mia:.4f} ∈ [0.48, 0.52] — halting epoch early")
+                        _mia_converged = True
+                        break
+
+            avg_loss = running_total / max(completed_steps, 1)
+
         else:
             raise ValueError(f"unsupported unlearn_algo: {unlearn_algo}")
             
@@ -260,15 +330,15 @@ def main():
               f"ra: {ra_score*100:.2f}% | fa: {fa_score*100:.2f}% | "
               f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f} | time: {epoch_unlearn_time:.2f}s")
         
-        # log to wandb
-        wandb.log({
-            "epoch": epoch + 1,
-            "unlearn_loss": avg_loss,
-            "retain_accuracy": ra_score,
-            "forget_accuracy": fa_score,
-            "test_accuracy": ta_score,
-            "mia_score": mia_score
-        })
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "unlearn_loss": avg_loss,
+                "retain_accuracy": ra_score,
+                "forget_accuracy": fa_score,
+                "test_accuracy": ta_score,
+                "mia_score": mia_score
+            })
         
         # -----------------------------------------------------------
         # early stopping check
@@ -277,6 +347,18 @@ def main():
             print(f"\n[!] early stopping triggered at epoch {epoch+1}!")
             print(f"[*] current fa ({fa_score*100:.2f}%) <= threshold ({fa_threshold*100:.2f}%)")
             break
+
+        if _mia_converged:
+            print(f"\n[!] mia convergence stop triggered at epoch {epoch+1}!")
+            print(f"[*] mia settled in [0.48, 0.52] — model is statistically indistinguishable from retrained")
+            break
+
+    # ------------------------------------------------------------------
+    # modular_unlearn — Phase 3: teardown (runs once after epoch loop)
+    # ------------------------------------------------------------------
+    if _modular_unlearner is not None:
+        _modular_unlearner.end_modular_unlearn()
+        print("[*] modular unlearning teardown complete; full gradient flow restored.")
 
     # 13. calculate final metrics (memory and total time)
     if torch.cuda.is_available():
@@ -288,17 +370,19 @@ def main():
     print(f"[*] total unlearn time (excluding evaluation): {total_unlearn_time:.2f} seconds")
     print(f"[*] peak gpu memory usage: {peak_memory_gb:.4f} gb")
     
-    wandb.log({
-        "total_unlearn_time_sec": total_unlearn_time,
-        "peak_memory_gb": peak_memory_gb
-    })
+    if use_wandb:
+        wandb.log({
+            "total_unlearn_time_sec": total_unlearn_time,
+            "peak_memory_gb": peak_memory_gb
+        })
 
     # 14. save the final unlearned model
     save_path = os.path.join(args.output_dir, f"unlearned_{unlearn_algo}_{yaml_filename}.pt")
     torch.save(model.state_dict(), save_path)
     print(f"[*] unlearning complete. model saved to {save_path}")
-    
-    wandb.finish()
+
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()

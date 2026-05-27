@@ -9,6 +9,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Dataset, Subset
 import wandb
 import yaml
+import torchvision.transforms as transforms
 
 # import dataloaders
 from dataset.pytorch_dataset.cifar100 import CIFAR100Dataset
@@ -26,6 +27,7 @@ from dataset.transform.unseen_transform import get_unseen_transform
 # import architectures
 from architecture.deity import DeiTArchitecture
 from architecture.resnet import ResNetArchitecture
+from architecture.moe_deit import MoEDeiTArchitecture
 
 # import metrics
 from metric.fa import forget_acc
@@ -105,17 +107,21 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"[*] using device: {device}")
     
-    # 3. initialize wandb
-    print("[*] initializing wandb...")
-    wandb.login(key="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")
-    run_name = f"base_{yaml_filename}"
-    
-    wandb.init(
-        project='learn',
-        name=run_name,
-        config=yaml_config, 
-        settings=wandb.Settings(start_method='thread')
-    )
+    use_wandb = getattr(args, 'use_wandb', True)
+
+    # 3. initialize wandb (skipped when use_wandb: false in config)
+    if use_wandb:
+        print("[*] initializing wandb...")
+        wandb.login(key="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")
+        run_name = f"base_{yaml_filename}"
+        wandb.init(
+            project='learn',
+            name=run_name,
+            config=yaml_config,
+            settings=wandb.Settings(start_method='thread')
+        )
+    else:
+        print("[*] wandb disabled (use_wandb: false)")
 
     # 4. load the raw dataset (without transforms yet)
     print(f"[*] loading dataset: {args.dataset}")
@@ -230,9 +236,18 @@ def main():
     unseen_loader = DataLoader(unseen_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # 9. initialize architecture dynamically
-    print(f"[*] initializing model: {args.model_name}")
+    use_moe = getattr(args, 'use_moe', False)
+    print(f"[*] initializing model: {args.model_name}{' (MoE)' if use_moe else ''}")
     if 'resnet' in args.model_name:
         model = ResNetArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
+    elif 'deit' in args.model_name and use_moe:
+        model = MoEDeiTArchitecture(
+            model_name=args.model_name,
+            num_classes=num_classes,
+            num_experts=getattr(args, 'num_experts', 4),
+            pretrained=args.pretrained,
+            device=device,
+        )
     elif 'deit' in args.model_name:
         model = DeiTArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
     else:
@@ -282,15 +297,15 @@ def main():
               f"ra: {ra_score*100:.2f}% | fa: {fa_score*100:.2f}% | "
               f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f} | time: {epoch_train_time:.2f}s")
         
-        # log to wandb
-        wandb.log({
-            "epoch": epoch + 1,
-            "train_loss": avg_loss,
-            "retain_accuracy": ra_score,
-            "forget_accuracy": fa_score,
-            "test_accuracy": ta_score,
-            "mia_score": mia_score
-        })
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss": avg_loss,
+                "retain_accuracy": ra_score,
+                "forget_accuracy": fa_score,
+                "test_accuracy": ta_score,
+                "mia_score": mia_score
+            })
 
     # 12. calculate final metrics (memory and total time)
     if torch.cuda.is_available():
@@ -302,19 +317,19 @@ def main():
     print(f"[*] total training time (excluding evaluation): {total_train_time:.2f} seconds")
     print(f"[*] peak gpu memory usage: {peak_memory_gb:.4f} gb")
     
-    # log final summaries to wandb
-    wandb.log({
-        "total_train_time_sec": total_train_time,
-        "peak_memory_gb": peak_memory_gb
-    })
+    if use_wandb:
+        wandb.log({
+            "total_train_time_sec": total_train_time,
+            "peak_memory_gb": peak_memory_gb
+        })
 
     # 13. save the final pretrained model
     save_path = os.path.join(args.output_dir, f"{yaml_filename}.pt")
     torch.save(model.state_dict(), save_path)
     print(f"[*] training complete. model saved to {save_path}")
-    
-    # close wandb run
-    wandb.finish()
+
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
