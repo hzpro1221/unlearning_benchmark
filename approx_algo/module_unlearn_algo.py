@@ -7,30 +7,28 @@ class ModularUnlearning:
     """
     Surgical three-phase unlearning for MoEDeiTArchitecture.
 
-    Exploits the model's explicit routing weights to identify and isolate the
-    subset of experts M_f ⊆ {0…M-1} most activated by the forget set.
-    Only those experts receive gradient updates; the backbone, router, classifier,
-    and remaining experts are fully frozen throughout the unlearning process.
+    Expert selection uses forget-specific responsibility to prefer experts that
+    are strongly activated by the forget set but not the retain set:
+
+        ρ_m = s_m(D_f) − α · s_m(D_r)
+
+    where s_m(D) = (1/|D|) Σ_{x∈D} π_m(x) is the mean routing mass over D.
+
+    Expert m is activated in every transformer block simultaneously.
+    The router, backbone, non-selected experts, and classifier remain frozen.
 
     Lifecycle
     ---------
-    Phase 1  begin_modular_unlearn(forget_loader)
-             → score experts via routing mass, select M_f, freeze rest,
-               snapshot teacher, create targeted optimizer.
-
-    Phase 2  update_modular_unlearn(forget_mb, retain_mb)   [called per step]
-             → one gradient step of:
-               L = L_forget + β·L_retain + γ·L_distill + λ_div·L_div
-
+    Phase 1  begin_modular_unlearn(forget_loader, retain_loader)
+    Phase 2  update_modular_unlearn(forget_mb, retain_mb)  [per step]
     Phase 3  end_modular_unlearn()
-             → release teacher and optimizer, restore requires_grad globally.
 
-    Model interface requirements
-    ----------------------------
-        model._forward(x)          → (logits, pi, h)   pi shape (B, M)
+    Required model interface
+    ------------------------
+        model._forward(x)          → (logits, pi, h)   pi shape (B, M), detached
         model.forward_with_grad(x) → (logits, features)
         model.inference(x)         → (logits, features)
-        model.moe_head.experts     — nn.ModuleList of M expert modules
+        model.moe_adapters         — list[MoEAdapter], one per transformer block
         model.num_experts          — int M
     """
 
@@ -40,97 +38,112 @@ class ModularUnlearning:
         lr: float = 1e-4,
         beta: float = 1.0,
         gamma: float = 1.0,
-        lambda_div: float = 0.0,
+        eta: float = 0.1,
+        alpha_resp: float = 1.0,
         top_k: int = None,
         tau: float = None,
         device: str = "cuda",
     ):
         """
         Args:
-            model:      MoEDeiTArchitecture instance.
-            lr:         Learning rate for the targeted optimizer.
-            beta:       Weight on L_retain.
-            gamma:      Weight on L_distill.
-            lambda_div: Weight on L_div (0 = disabled).
-            top_k:      Activate the top-k highest-scored experts.
-                        Mutually exclusive with tau; top_k takes priority.
-            tau:        Activate every expert whose routing-mass score > tau.
-                        Falls back to top-1 if no expert exceeds the threshold.
-            device:     'cuda' or 'cpu'.
+            model:       MoEDeiTArchitecture instance.
+            lr:          Learning rate for the targeted Adam optimizer.
+            beta:        Weight on L_retain.
+            gamma:       Weight on L_distill (KL from frozen teacher on retain).
+            eta:         Weight on L_sep (retained expert separation). 0 = disabled.
+            alpha_resp:  α in ρ_m = s_m(D_f) − α · s_m(D_r).
+                         0 = raw forget routing mass; 1 = forget-minus-retain.
+            top_k:       Activate the top-k highest-ρ experts. Priority over tau.
+            tau:         Activate experts with ρ_m > tau.
+                         Falls back to top-1 if none qualify.
+            device:      'cuda' or 'cpu'.
 
-        Selection priority:
-            top_k given → select top-k
-            tau given   → select score > tau  (fallback to top-1)
-            neither     → default to top max(1, M // 4)
+        If neither top_k nor tau is given, defaults to top max(1, M // 4).
         """
-        if not hasattr(model, '_forward') or not hasattr(model, 'moe_head'):
+        if not hasattr(model, '_forward') or not hasattr(model, 'moe_adapters'):
             raise TypeError(
-                "model must expose ._forward() and .moe_head "
-                "(use MoEDeiTArchitecture, not standard DeiTArchitecture)"
+                "model must expose ._forward() and .moe_adapters "
+                "(use MoEDeiTArchitecture, not DeiTArchitecture)"
             )
 
         self.model = model
         self.lr = lr
         self.beta = beta
         self.gamma = gamma
-        self.lambda_div = lambda_div
+        self.eta = eta
+        self.alpha_resp = alpha_resp
         self.top_k = top_k
         self.tau = tau
         self.device = device
 
-        # populated in begin_modular_unlearn, cleared in end_modular_unlearn
         self._teacher = None
         self._optimizer = None
         self._active_indices: list = []
+        self._retain_indices: list = []
 
     # ------------------------------------------------------------------
     # Phase 1 — Setup
     # ------------------------------------------------------------------
 
-    def begin_modular_unlearn(self, forget_loader) -> dict:
+    def begin_modular_unlearn(self, forget_loader, retain_loader) -> dict:
         """
-        Scores all M experts on the forget set, selects M_f, freezes the
-        non-selected components, builds a frozen teacher, and creates a
-        targeted Adam optimizer over the active expert parameters only.
+        Computes forget-specific responsibility ρ_m for every expert,
+        selects M_f, freezes all params except expert[m] for m ∈ M_f
+        across every transformer block, snapshots a frozen teacher, and
+        creates a targeted Adam optimizer.
 
         Args:
-            forget_loader: DataLoader yielding (images, labels [, domain]) tuples.
+            forget_loader: DataLoader yielding (images, labels [, domain]).
+            retain_loader: DataLoader yielding (images, labels [, domain]).
 
         Returns:
             dict:
-                'expert_indices' — sorted list of selected expert indices in M_f.
-                'scores'         — list of per-expert routing-mass scores (index = expert).
+                'expert_indices'   — sorted list of selected expert indices M_f.
+                'scores_forget'    — s_m(D_f) per expert (list, index = expert).
+                'scores_retain'    — s_m(D_r) per expert (list, index = expert).
+                'responsibility'   — ρ_m per expert (list, index = expert).
         """
-        # --- 1a. score experts on forget set via routing weights ---
-        scores = self._score_experts(forget_loader)
+        M = self.model.num_experts
 
-        # --- 1b. select M_f ---
-        self._active_indices = self._select_experts(scores)
+        # --- 1a. score experts on forget and retain sets ---
+        scores_f = self._routing_mass(forget_loader)   # (M,) s_m(D_f)
+        scores_r = self._routing_mass(retain_loader)   # (M,) s_m(D_r)
 
-        # --- 1c. freeze everything; unfreeze M_f experts only ---
+        # --- 1b. forget-specific responsibility: ρ_m = s_m(D_f) - α·s_m(D_r) ---
+        rho = scores_f - self.alpha_resp * scores_r    # (M,)
+
+        # --- 1c. select M_f ---
+        self._active_indices = self._select_experts(rho)
+        self._retain_indices = [m for m in range(M) if m not in set(self._active_indices)]
+
+        # --- 1d. freeze all params; unfreeze expert[m] in every block for m ∈ M_f ---
         for param in self.model.parameters():
             param.requires_grad_(False)
-        for idx in self._active_indices:
-            for param in self.model.moe_head.experts[idx].parameters():
-                param.requires_grad_(True)
+        for adapter in self.model.moe_adapters:
+            for m in self._active_indices:
+                for param in adapter.experts[m].parameters():
+                    param.requires_grad_(True)
 
-        # --- 1d. frozen teacher snapshot for distillation ---
+        # --- 1e. frozen teacher snapshot ---
         self._teacher = copy.deepcopy(self.model)
         for param in self._teacher.parameters():
             param.requires_grad_(False)
         self._teacher.eval()
 
-        # --- 1e. optimizer over active expert params only ---
+        # --- 1f. optimizer over active expert params only ---
         active_params = [
             p
-            for idx in self._active_indices
-            for p in self.model.moe_head.experts[idx].parameters()
+            for adapter in self.model.moe_adapters
+            for m in self._active_indices
+            for p in adapter.experts[m].parameters()
         ]
         self._optimizer = torch.optim.Adam(active_params, lr=self.lr)
 
         return {
-            "expert_indices": self._active_indices,
-            "scores": scores.tolist(),
+            "expert_indices":  self._active_indices,
+            "scores_forget":   scores_f.tolist(),
+            "scores_retain":   scores_r.tolist(),
+            "responsibility":  rho.tolist(),
         }
 
     # ------------------------------------------------------------------
@@ -141,20 +154,25 @@ class ModularUnlearning:
         """
         One gradient step of the modular unlearning objective:
 
-            L_forget  = -CE(model(x_f), y_f)          [gradient ascent on forget]
-            L_retain  =  CE(model(x_r), y_r)           [preserve retain performance]
-            L_distill =  KL(teacher(x_r) ‖ model(x_r)) [anchor to original knowledge]
-            L_div     =  Frobenius decorrelation of M_f weight matrices  [optional]
+            L_forget  = -CE(model(x_f), y_f)            [gradient ascent]
+            L_retain  =  CE(model(x_r), y_r)             [preserve accuracy]
+            L_distill =  KL(p_old(y|x_r) ‖ p_new(y|x_r)) [output stability]
+            L_sep     =  Σ_{m∈M_f} Σ_{n∈M_r}
+                             ‖(1/B) H̃_m(x_r)^T H̃_n(x_r)‖_F²  [expert separation]
 
-            L_total = L_forget + β·L_retain + γ·L_distill + λ_div·L_div
+            L_unlearn = L_forget + β·L_retain + γ·L_distill + η·L_sep
+
+        L_sep is computed from adapter.last_expert_outputs which is populated
+        by the retain forward pass. Gradients flow through H_m (active experts)
+        but not through H_n (frozen experts — their params have requires_grad=False).
 
         Args:
             minibatch_forget: tuple (images, labels [, domain]) from forget_loader.
             minibatch_retain: tuple (images, labels [, domain]) from retain_loader.
 
         Returns:
-            dict of scalar loss components (Python floats):
-                'total', 'l_forget', 'l_retain', 'l_distill', 'l_div'
+            dict of scalar loss components: 'total', 'l_forget', 'l_retain',
+            'l_distill', 'l_sep'.
         """
         x_f = minibatch_forget[0].to(self.device)
         y_f = minibatch_forget[1].to(self.device)
@@ -163,15 +181,16 @@ class ModularUnlearning:
 
         self._optimizer.zero_grad()
 
-        # L_forget — negative CE on forget set (gradient ascent)
+        # L_forget — gradient ascent on forget set
         logits_f, _ = self.model.forward_with_grad(x_f)
         l_forget = -F.cross_entropy(logits_f, y_f)
 
         # L_retain — standard CE on retain set
+        # after this call, adapter.last_expert_outputs holds retain batch outputs
         logits_r, _ = self.model.forward_with_grad(x_r)
         l_retain = F.cross_entropy(logits_r, y_r)
 
-        # L_distill — KL(teacher_probs ‖ student_probs) on retain set
+        # L_distill — KL(p_old ‖ p_new) on retain set
         teacher_logits_r, _ = self._teacher.inference(x_r)
         l_distill = F.kl_div(
             F.log_softmax(logits_r, dim=-1),
@@ -179,16 +198,16 @@ class ModularUnlearning:
             reduction="batchmean",
         )
 
-        # L_div — optional Frobenius decorrelation across active expert weights
-        l_div = torch.tensor(0.0, device=self.device)
-        if self.lambda_div > 0.0:
-            l_div = self._diversity_loss()
+        # L_sep — retained expert separation (computed from retain batch outputs)
+        l_sep = torch.tensor(0.0, device=self.device)
+        if self.eta > 0.0 and self._retain_indices:
+            l_sep = self._sep_loss()
 
         total = (
             l_forget
-            + self.beta * l_retain
-            + self.gamma * l_distill
-            + self.lambda_div * l_div
+            + self.beta    * l_retain
+            + self.gamma   * l_distill
+            + self.eta     * l_sep
         )
 
         total.backward()
@@ -199,7 +218,7 @@ class ModularUnlearning:
             "l_forget":  l_forget.item(),
             "l_retain":  l_retain.item(),
             "l_distill": l_distill.item(),
-            "l_div":     l_div.item(),
+            "l_sep":     l_sep.item(),
         }
 
     # ------------------------------------------------------------------
@@ -207,15 +226,12 @@ class ModularUnlearning:
     # ------------------------------------------------------------------
 
     def end_modular_unlearn(self):
-        """
-        Releases the teacher copy and optimizer, then restores requires_grad=True
-        globally across all model parameters.
-        """
+        """Releases teacher and optimizer; restores requires_grad globally."""
         del self._teacher
         self._teacher = None
         self._optimizer = None
         self._active_indices = []
-
+        self._retain_indices = []
         for param in self.model.parameters():
             param.requires_grad_(True)
 
@@ -223,77 +239,85 @@ class ModularUnlearning:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _score_experts(self, forget_loader) -> torch.Tensor:
+    def _routing_mass(self, loader) -> torch.Tensor:
         """
-        Accumulates routing mass per expert over the forget set:
-            scores[m] += Σ_{x in batch} π_m(x)
+        Computes mean routing mass per expert over the given loader:
+            s_m(D) = (1/|D|) Σ_{x∈D} π_m(x)
 
-        Uses eval mode and no_grad since we are only accumulating statistics,
-        not computing gradients for a training step.
+        π_m(x) is the per-expert routing probability averaged over all
+        transformer blocks and token positions (returned by model._forward).
 
         Returns:
-            scores: (M,) tensor of accumulated routing mass per expert.
+            scores: (M,) tensor, detached.
         """
         M = self.model.num_experts
         scores = torch.zeros(M, device=self.device)
+        n_samples = 0
 
         self.model.eval()
         with torch.no_grad():
-            for batch in forget_loader:
+            for batch in loader:
                 x = batch[0].to(self.device)
-                _logits, pi, _h = self.model._forward(x)
-                # pi: (B, M) — sum over batch dimension
+                _logits, pi, _h = self.model._forward(x)   # pi: (B, M), detached
                 scores += pi.sum(dim=0)
+                n_samples += pi.shape[0]
 
-        return scores
+        return scores / max(n_samples, 1)
 
-    def _select_experts(self, scores: torch.Tensor) -> list:
+    def _select_experts(self, rho: torch.Tensor) -> list:
         """
-        Returns a sorted list of expert indices to activate (M_f).
+        Returns sorted expert indices M_f from responsibility scores ρ.
 
-        Selection priority:
-            top_k set  → select indices of top-k scores
-            tau set    → select indices where score > tau; fallback to argmax
-            neither    → default to top max(1, M // 4) experts
+        Priority: top_k → tau → default top-max(1, M//4).
         """
         M = self.model.num_experts
 
         if self.top_k is not None:
-            k = min(self.top_k, M)
-            indices = scores.topk(k).indices.tolist()
+            indices = rho.topk(min(self.top_k, M)).indices.tolist()
 
         elif self.tau is not None:
-            indices = (scores > self.tau).nonzero(as_tuple=True)[0].tolist()
+            indices = (rho > self.tau).nonzero(as_tuple=True)[0].tolist()
             if not indices:
-                indices = [int(scores.argmax().item())]
+                indices = [int(rho.argmax().item())]
 
         else:
-            # default: top M/4 experts
             k = max(1, M // 4)
-            indices = scores.topk(k).indices.tolist()
+            indices = rho.topk(k).indices.tolist()
 
         return sorted(indices)
 
-    def _diversity_loss(self) -> torch.Tensor:
+    def _sep_loss(self, eps: float = 1e-8) -> torch.Tensor:
         """
-        Frobenius decorrelation penalty on the weight matrices of M_f experts.
-        Encourages selected experts to maintain diverse representations.
+        Retained expert separation loss.
 
-            L_div = mean |corr(w_i, w_j)| for all i ≠ j in M_f
+        For each transformer block and each active/frozen expert pair (m, n)
+        with m ∈ M_f, n ∈ M_r:
 
-        where corr(w_i, w_j) = (w_i/‖w_i‖) · (w_j/‖w_j‖).
+            L_sep += ‖(1/B) H̃_m(x_r)^T H̃_n(x_r)‖_F²
+
+        H_m = adapter.last_expert_outputs[:, m, :]  ∈ R^{B×D}
+        H̃_m = H_m / (‖H_m‖_F + ε)
+
+        Gradient flows through H_m (active expert, requires_grad=True).
+        H_n has no grad (frozen expert params → no leaf tensor requires grad).
         """
-        weight_vecs = []
-        for idx in self._active_indices:
-            for name, param in self.model.moe_head.experts[idx].named_parameters():
-                if 'weight' in name and param.requires_grad:
-                    v = param.view(-1).float()
-                    weight_vecs.append(v / v.norm(2).clamp(min=1e-8))
+        total = torch.tensor(0.0, device=self.device)
+        M_f = self._active_indices
+        M_r = self._retain_indices
 
-        if len(weight_vecs) < 2:
-            return torch.tensor(0.0, device=self.device)
+        for adapter in self.model.moe_adapters:
+            if adapter.last_expert_outputs is None:
+                continue
+            H = adapter.last_expert_outputs  # (B, M, D), populated by retain forward
+            B = H.shape[0]
 
-        stack = torch.stack(weight_vecs)          # (G, D_flat)
-        gram = stack @ stack.T                    # (G, G) pairwise cosine similarities
-        mask = ~torch.eye(gram.shape[0], dtype=torch.bool, device=self.device)
-        return gram[mask].abs().mean()
+            for m in M_f:
+                H_m = H[:, m, :]                                    # (B, D), with grad
+                H_m_n = H_m / (H_m.norm() + eps)
+                for n in M_r:
+                    H_n = H[:, n, :]                                # (B, D), no grad
+                    H_n_n = H_n / (H_n.norm() + eps)
+                    cross = (H_m_n.T @ H_n_n) / B                  # (D, D)
+                    total = total + cross.pow(2).sum()
+
+        return total

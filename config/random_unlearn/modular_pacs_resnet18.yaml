@@ -1,0 +1,31 @@
+dataset: "pacs"
+data_dir: "./dataset/data_folder/pacs"
+
+model_name: "resnet18"
+pretrained: false
+
+batch_size: 32
+lr: 0.0001
+epochs: 200
+fa_threshold: 0.80
+seed: 42
+
+forget_ratio: 0.2
+pretrained_model_path: "checkpoint/learn/pacs_resnet18.pt"
+unlearn_algo: "modular_unlearn"
+
+# --- modular unlearning hyperparameters ---
+# select top-k highest-scored module groups to activate (mutually exclusive with modular_tau)
+modular_top_k: 2
+
+# alternatively: activate every group whose forget-relevance score exceeds tau
+# modular_tau: 0.001
+
+# weight on L_retain (CE on retain set)
+modular_beta: 1.0
+
+# weight on L_distill (KL divergence from frozen teacher on retain set)
+modular_gamma: 1.0
+
+# weight on optional L_div diversity penalty (0.0 = disabled)
+modular_lambda_div: 0.0

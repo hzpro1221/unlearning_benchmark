@@ -26,9 +26,14 @@ modular_top_k: 2
 # modular_tau: 0.05
 
 # --- loss weights ---
-modular_beta: 1.0        # weight on L_retain
-modular_gamma: 1.0       # weight on L_distill (KL from frozen teacher)
-modular_lambda_div: 0.0  # weight on L_div diversity penalty (0 = disabled)
+modular_beta:       2.0   # β: weight on L_retain
+modular_gamma:      0.5   # γ: weight on L_distill (KL from frozen teacher)
+modular_eta:        0.1   # η: weight on L_sep (retained expert separation)
+
+# --- expert responsibility ---
+# α in ρ_m = s_m(D_f) − α·s_m(D_r)
+# 0 = raw forget routing mass; 1 = forget-minus-retain (default)
+modular_alpha_resp: 1.0
 
 # --- step-interval MIA convergence check ---
 # run MIA eval every N steps; halt when MIA ∈ [0.48, 0.52]

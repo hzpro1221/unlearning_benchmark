@@ -17,5 +17,11 @@ lr: 0.0001
 epochs: 100
 seed: 42
 
+# --- MoE auxiliary loss weights ---
+lambda_sp:  0.1     # L_sp: routing entropy (encourage sparse routing)
+lambda_bal: 0.1     # L_bal: balance regularizer (prevent routing collapse)
+lambda_div: 0.01    # L_div: expert decorrelation (encourage specialisation)
+ema_alpha:  0.99    # EMA decay for L_bal estimator
+
 # checkpoint saved to: checkpoint/learn/pacs_moe_deit_small.pt
 # this path is referenced by pretrained_model_path in the unlearn config

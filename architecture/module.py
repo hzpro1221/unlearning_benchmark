@@ -3,57 +3,67 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ExplicitMoEHead(nn.Module):
+class ExpertFFN(nn.Module):
     """
-    Mixture-of-Experts classification head with explicit routing exposure.
+    A single expert — 2-layer MLP matching the DeiT block FFN structure.
 
-    Mathematical flow:
-        h_m = E_m(z)            individual expert projections   (B, D) × M
-        π(z) = softmax(G(z))    soft routing weights             (B, M)
-        h(z) = Σ_m π_m · h_m   expert-blended feature vector   (B, D)
-        ŷ    = C(h(z))          class logits                    (B, num_classes)
+        z → fc1 → GELU → drop → fc2 → drop → h_m
+    """
+
+    def __init__(self, embed_dim: int, hidden_dim: int, drop: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class MoEAdapter(nn.Module):
+    """
+    Replaces the FFN (mlp) inside a DeiT transformer block.
+
+    Mathematical flow per token position:
+        π(z) = softmax(G(z))       routing weights   (B, T, M)
+        h_m  = E_m(z)              expert output     (B, T, D)
+        h    = Σ_m π_m · h_m      blended output    (B, T, D)
+
+    After every forward pass two tensors are stored as attributes:
+
+        last_routing_weights  (B, T, M)  — kept WITH gradient for L_sp.
+                                           Callers that only need values
+                                           should use .detach() themselves.
+
+        last_expert_outputs   (B, M, D)  — token-averaged expert outputs,
+                                           kept WITH gradient for L_div
+                                           (training) and L_sep (unlearning).
 
     Attributes:
-        experts    (nn.ModuleList): M expert Linear layers E_m.
-        router     (nn.Linear):    Gating network G(z) → (B, M) logits.
-        classifier (nn.Linear):    Projection head C(h) → (B, num_classes).
+        experts  (nn.ModuleList): M ExpertFFN modules.
+        router   (nn.Linear):    Gating network G — Linear(D, M).
     """
 
-    def __init__(self, embed_dim: int, num_experts: int, num_classes: int):
-        """
-        Args:
-            embed_dim:   Dimension of the input feature vector z from the featurizer.
-            num_experts: Number of expert modules M.
-            num_classes: Number of output classes.
-        """
+    def __init__(self, embed_dim: int, hidden_dim: int, num_experts: int, drop: float = 0.0):
         super().__init__()
         self.num_experts = num_experts
-
-        # E_m: each expert is a single linear projection (simple yet interpretable)
         self.experts = nn.ModuleList([
-            nn.Linear(embed_dim, embed_dim) for _ in range(num_experts)
+            ExpertFFN(embed_dim, hidden_dim, drop) for _ in range(num_experts)
         ])
-        # G(z): routing network — produces un-normalised gating logits
         self.router = nn.Linear(embed_dim, num_experts)
-        # C(h): final classification projection
-        self.classifier = nn.Linear(embed_dim, num_classes)
+        self.last_routing_weights: torch.Tensor = None   # (B, T, M), with grad
+        self.last_expert_outputs: torch.Tensor = None    # (B, M, D), with grad
 
-    def forward(self, z: torch.Tensor):
-        """
-        Args:
-            z: Feature tensor from the featurizer, shape (B, embed_dim).
-
-        Returns:
-            logits: Class predictions (B, num_classes).
-            pi:     Routing weights   (B, num_experts), sums to 1 over experts.
-            h:      Blended features  (B, embed_dim).
-        """
-        # (B, M, D) — stack all M expert outputs along dim 1
-        h_stack = torch.stack([expert(z) for expert in self.experts], dim=1)
-        # (B, M) — normalised routing weights
-        pi = F.softmax(self.router(z), dim=-1)
-        # (B, D) — convex combination of expert outputs weighted by π
-        h = (pi.unsqueeze(-1) * h_stack).sum(dim=1)
-        # (B, C) — final classification
-        logits = self.classifier(h)
-        return logits, pi, h
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        pi = F.softmax(self.router(x), dim=-1)               # (B, T, M)
+        self.last_routing_weights = pi                        # keep grad for L_sp
+        h_stack = torch.stack([e(x) for e in self.experts], dim=2)  # (B, T, M, D)
+        self.last_expert_outputs = h_stack.mean(dim=1)        # (B, M, D), keep grad
+        return (pi.unsqueeze(-1) * h_stack).sum(dim=2)        # (B, T, D)

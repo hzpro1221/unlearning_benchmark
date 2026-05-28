@@ -35,6 +35,101 @@ from metric.ra import retain_acc
 from metric.ta import test_acc
 from metric.mia import mia
 
+# ------------------------------------------------------------------
+# MoE auxiliary training losses
+# ------------------------------------------------------------------
+
+def _compute_sp_loss(moe_adapters) -> torch.Tensor:
+    """
+    Routing sparsity loss — minimise routing entropy so each sample
+    activates a small subset of experts.
+
+        L_sp = E_x[ -Σ_m π_m(x) log π_m(x) ]
+
+    Accumulated and averaged over all transformer blocks.
+    Gradients flow through adapter.last_routing_weights → router params.
+    """
+    total, count = None, 0
+    for a in moe_adapters:
+        if a.last_routing_weights is None:
+            continue
+        pi = a.last_routing_weights                          # (B, T, M), with grad
+        entropy = -(pi * (pi + 1e-8).log()).sum(dim=-1)     # (B, T)
+        block_sp = entropy.mean()
+        total = block_sp if total is None else total + block_sp
+        count += 1
+    return total / count if count > 0 else torch.tensor(0.0)
+
+
+def _compute_bal_loss(moe_adapters, ema_pi: torch.Tensor, ema_alpha: float):
+    """
+    Routing balance loss — prevent routing collapse by penalising
+    deviation of per-expert usage from the uniform target 1/M.
+
+        L_bal = Σ_m (π̂_m - 1/M)²
+
+    π̂_m is an EMA estimate of mean routing probability for expert m:
+        π̂_m^(t) = α · π̂_m^(t-1).detach() + (1-α) · batch_mean_m
+
+    The (1-α) term retains gradient so the loss differentiates through
+    the current batch's routing probabilities → router params.
+    The α · prev term is detached so gradients don't accumulate across steps.
+
+    Returns:
+        l_bal     — scalar loss tensor (with grad)
+        new_ema   — updated EMA tensor (detached, for use in next step)
+    """
+    M = ema_pi.shape[0]
+    pis = [a.last_routing_weights for a in moe_adapters if a.last_routing_weights is not None]
+    if not pis:
+        return torch.tensor(0.0), ema_pi
+
+    # Average over blocks, batch, and token positions → (M,), with grad
+    stacked = torch.stack(pis, dim=0)           # (num_blocks, B, T, M)
+    batch_mean = stacked.mean(dim=(0, 1, 2))    # (M,)
+
+    # EMA update: only the (1-alpha) * batch_mean term carries gradient
+    new_ema = ema_alpha * ema_pi.detach() + (1.0 - ema_alpha) * batch_mean
+    l_bal = ((new_ema - 1.0 / M) ** 2).sum()
+
+    return l_bal, new_ema.detach()
+
+
+def _compute_div_loss(moe_adapters, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Expert specialisation loss — penalise cross-expert output correlation.
+
+        L_div = Σ_{m≠n} ‖(1/B) H̃_m^T H̃_n‖_F²
+
+    where H̃_m = H_m / (‖H_m‖_F + ε), H_m ∈ R^{B×D} is the token-averaged
+    output of expert m over the current mini-batch.
+    Accumulated over all transformer blocks.
+    Gradients flow through adapter.last_expert_outputs → expert params.
+    """
+    total = None
+    for a in moe_adapters:
+        if a.last_expert_outputs is None:
+            continue
+        H = a.last_expert_outputs       # (B, M, D), with grad
+        B, M, D = H.shape
+
+        # Per-expert Frobenius norm: ‖H_m‖_F where H_m ∈ R^{B×D}
+        # = sqrt(Σ_b Σ_d H[b,m,d]²) vectorised over M
+        norms = H.pow(2).sum(dim=2).sum(dim=0).sqrt().clamp(min=eps)  # (M,)
+        H_n = H / norms.view(1, -1, 1)  # (B, M, D) normalised
+
+        block_div = H.new_zeros(())
+        for m in range(M):
+            for n in range(m + 1, M):
+                cross = (H_n[:, m, :].T @ H_n[:, n, :]) / B  # (D, D)
+                block_div = block_div + cross.pow(2).sum()
+        block_div = block_div * 2   # count both (m,n) and (n,m)
+
+        total = block_div if total is None else total + block_div
+
+    return total if total is not None else torch.tensor(0.0)
+
+
 class ApplyTransform(Dataset):
     """
     helper class to apply specific transforms to a pytorch subset.
@@ -261,22 +356,47 @@ def main():
     print("[*] starting training phase...")
     total_train_time = 0.0
 
+    # MoE auxiliary loss hyper-parameters (read from config; defaults are conservative)
+    if use_moe:
+        lambda_sp  = getattr(args, 'lambda_sp',  0.1)
+        lambda_bal = getattr(args, 'lambda_bal',  0.1)
+        lambda_div = getattr(args, 'lambda_div',  0.01)
+        ema_alpha  = getattr(args, 'ema_alpha',   0.99)
+        M = model.num_experts
+        ema_pi = torch.full((M,), 1.0 / M, device=device)  # uniform init
+        print(f"[*] moe auxiliary losses: λ_sp={lambda_sp} λ_bal={lambda_bal} "
+              f"λ_div={lambda_div} ema_α={ema_alpha}")
+
     for epoch in range(args.epochs):
         # -- train one epoch --
         model.train()
         total_loss = 0.0
-        
+
         # start timer for pure training operations
         epoch_start_time = time.time()
-        
+
         for batch in train_loader:
             images = batch[0].to(device)
             labels = batch[1].to(device)
-            
+
             optimizer.zero_grad()
             logits, _ = model.forward_with_grad(images)
-            loss = criteria(logits, labels)
-            
+
+            l_task = criteria(logits, labels)
+
+            if use_moe:
+                # adapter.last_routing_weights and last_expert_outputs are
+                # populated by model.forward_with_grad() above
+                l_sp  = _compute_sp_loss(model.moe_adapters)
+                l_bal, ema_pi = _compute_bal_loss(model.moe_adapters, ema_pi, ema_alpha)
+                l_div = _compute_div_loss(model.moe_adapters)
+                loss = (l_task
+                        + lambda_sp  * l_sp
+                        + lambda_bal * l_bal
+                        + lambda_div * l_div)
+            else:
+                loss = l_task
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()

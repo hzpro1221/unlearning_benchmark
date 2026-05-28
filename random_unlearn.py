@@ -230,18 +230,20 @@ def main():
             lr=args.lr,
             beta=getattr(args, 'modular_beta', 1.0),
             gamma=getattr(args, 'modular_gamma', 1.0),
-            lambda_div=getattr(args, 'modular_lambda_div', 0.0),
+            eta=getattr(args, 'modular_eta', 0.1),
+            alpha_resp=getattr(args, 'modular_alpha_resp', 1.0),
             top_k=getattr(args, 'modular_top_k', None),
             tau=getattr(args, 'modular_tau', None),
             device=device,
         )
-        info = _modular_unlearner.begin_modular_unlearn(forget_train_loader)
+        info = _modular_unlearner.begin_modular_unlearn(forget_train_loader, retain_train_loader)
         active_set = set(info['expert_indices'])
         print(f"[*] modular unlearning: M_f = {info['expert_indices']} "
               f"({len(active_set)} of {model.num_experts} experts activated)")
-        for m, s in enumerate(info['scores']):
+        for m, (sf, sr, rho) in enumerate(zip(
+                info['scores_forget'], info['scores_retain'], info['responsibility'])):
             marker = "  [ACTIVE]" if m in active_set else ""
-            print(f"        expert[{m}]: routing_mass={s:.4f}{marker}")
+            print(f"        expert[{m}]: s_f={sf:.4f}  s_r={sr:.4f}  ρ={rho:+.4f}{marker}")
 
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
@@ -343,7 +345,7 @@ def main():
         # -----------------------------------------------------------
         # early stopping check
         # -----------------------------------------------------------
-        if fa_score <= fa_threshold:
+        if unlearn_algo != 'modular_unlearn' and fa_score <= fa_threshold:
             print(f"\n[!] early stopping triggered at epoch {epoch+1}!")
             print(f"[*] current fa ({fa_score*100:.2f}%) <= threshold ({fa_threshold*100:.2f}%)")
             break
