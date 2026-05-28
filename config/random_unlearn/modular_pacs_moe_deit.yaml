@@ -1,0 +1,41 @@
+use_wandb: false   # set to true to enable wandb logging
+
+dataset: "pacs"
+data_dir: "/home/pnu_r/AMC/MoE/MoE_Unlearning/domainbed/data/PACS"
+
+# model config
+model_name: "deit_small_patch16_224"
+pretrained: false
+use_moe: true          # switches from DeiTArchitecture → MoEDeiTArchitecture
+num_experts: 8         # M — total number of experts in ExplicitMoEHead
+
+batch_size: 32
+lr: 0.0001
+epochs: 200
+fa_threshold: 0.80
+seed: 42
+
+forget_ratio: 0.2
+pretrained_model_path: "checkpoint/learn/pacs_moe_deit_small.pt"
+unlearn_algo: "modular_unlearn"
+
+# --- expert selection ---
+# top-k: activate the k highest routing-mass experts (takes priority over tau)
+modular_top_k: 2
+# tau: activate experts where score > tau (uncomment to use instead of top_k)
+# modular_tau: 0.05
+
+# --- loss weights ---
+modular_beta:       2.0   # β: weight on L_retain
+modular_gamma:      0.5   # γ: weight on L_distill (KL from frozen teacher)
+modular_eta:        0.1   # η: weight on L_sep (retained expert separation)
+
+# --- expert responsibility ---
+# α in ρ_m = s_m(D_f) − α·s_m(D_r)
+# 0 = raw forget routing mass; 1 = forget-minus-retain (default)
+modular_alpha_resp: 1.0
+
+# --- step-interval MIA convergence check ---
+# run MIA eval every N steps; halt when MIA ∈ [0.48, 0.52]
+# default (omitted): eval once per epoch (= min(forget_steps, retain_steps))
+# modular_eval_interval: 50
