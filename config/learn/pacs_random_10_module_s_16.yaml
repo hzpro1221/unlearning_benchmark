@@ -20,3 +20,5 @@ epochs: 50
 batch_size: 32
 lr: 5.0e-4
 seed: 42
+
+# epoch [6/50] | total_loss: 0.4175 (ce: 0.3652, sp: 0.1232, bal: 0.3922, div: 0.0072) | ra: 91.03% | fa: 90.61% | ta: 85.19% | mia: 0.5569 | time: 84.03s
