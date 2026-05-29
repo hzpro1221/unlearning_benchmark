@@ -22,7 +22,6 @@ class L1_Sparse(Gradient_Ascent):
         alpha=0.1,
         device="cuda"
     ):
-        # inherit base configurations from gradient ascent
         super().__init__(
             model=model,
             train_loader=train_loader,
@@ -40,7 +39,6 @@ class L1_Sparse(Gradient_Ascent):
         self.alpha = alpha
 
     def unlearn(self, fa_threshold, ckpt_path):
-        # execute unlearning via gradient ascent and l1 regularization
         self.model.train()
         total_unlearn_time = 0.0
         
@@ -56,7 +54,6 @@ class L1_Sparse(Gradient_Ascent):
                 logits, _ = self.model.forward_with_grad(images)
                 ce_loss = self.criteria(logits, labels)
                 
-                # compute l1 norm for non-normalization weights
                 l1_penalty = 0.0
                 num_params = 0 
                 
@@ -68,7 +65,6 @@ class L1_Sparse(Gradient_Ascent):
                 if num_params > 0:
                     l1_penalty = l1_penalty / num_params
                 
-                # ascent on cross-entropy to forget, descent on l1 penalty for sparsity
                 batch_loss = -(ce_loss) + (self.alpha * l1_penalty)
                 
                 batch_loss.backward()
@@ -98,7 +94,6 @@ class L1_Sparse(Gradient_Ascent):
             
             torch.save(self.model.state_dict(), f"{ckpt_path}_epoch_{epoch+1}.pt")
             
-            # halt unlearning if forget accuracy target is reached
             if fa_score <= fa_threshold:
                 print(f"[*] early stopping triggered at epoch {epoch+1} (FA <= {fa_threshold})")
                 break
