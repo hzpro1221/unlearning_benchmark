@@ -1,10 +1,12 @@
 import os
 import time
+import copy
 import torch
+import torch.nn.functional as F
 import wandb
 from approx_algo.gradient_ascent import Gradient_Ascent
 
-class Random_Labeling(Gradient_Ascent):
+class Finetune(Gradient_Ascent):
     def unlearn(self, fa_threshold, ckpt_path):
         self.model.train()
         total_unlearn_time = 0.0
@@ -13,34 +15,19 @@ class Random_Labeling(Gradient_Ascent):
             epoch_start_time = time.time()
             total_loss = 0.0
             
-            for batch in self.forget_loader:
+            for batch in self.retain_loader:  
                 images = batch[0].to(self.device)
                 labels = batch[1].to(self.device)
                 
                 self.optimizer.zero_grad()
-                
                 logits, _ = self.model.forward_with_grad(images)
-                num_classes = logits.shape[1]
-                
-                shifts = torch.randint(
-                    low=1, 
-                    high=num_classes, 
-                    size=labels.shape, 
-                    dtype=labels.dtype, 
-                    device=self.device
-                )
-                
-                # apply shift to create fake labels
-                random_labels = (labels + shifts) % num_classes
-                
-                loss = self.criteria(logits, random_labels)
+                loss = self.criteria(logits, labels)
                 
                 loss.backward()
                 self.optimizer.step()
-                
                 total_loss += loss.item()
                 
-            avg_loss = total_loss / len(self.forget_loader)
+            avg_loss = total_loss / len(self.retain_loader)
             epoch_time = time.time() - epoch_start_time
             total_unlearn_time += epoch_time
             
@@ -65,12 +52,9 @@ class Random_Labeling(Gradient_Ascent):
             if fa_score <= fa_threshold:
                 print(f"[*] early stopping triggered at epoch {epoch+1} (FA <= {fa_threshold})")
                 break
-
+                
         peak_memory_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
-        wandb.log({
-            "total_train_time_sec": total_unlearn_time,
-            "peak_memory_gb": peak_memory_gb
-        })
-
+        wandb.log({"total_unlearn_time_sec": total_unlearn_time, "peak_memory_gb": peak_memory_gb})
         torch.save(self.model.state_dict(), f"{ckpt_path}.pt")
         return total_unlearn_time
+

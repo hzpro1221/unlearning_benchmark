@@ -1,76 +1,115 @@
+import os
+import time
 import torch
+import wandb
+from approx_algo.gradient_ascent import Gradient_Ascent
 
-def boundary_shrink(model, criteria, optimizer, forget_loader, epsilon=0.1, device="cuda"):
-    """
-    performs unlearning by shifting the forget data towards the nearest decision boundary.
-    it does this by generating adversarial labels using fgsm, then training the model
-    to predict those adversarial labels for the original images.
-    
-    args:
-        model: architecture inherited from BaseArchitecture.
-        criteria: loss function (e.g., nn.CrossEntropyLoss()).
-        optimizer: PyTorch optimizer (e.g., Adam, SGD).
-        forget_loader: DataLoader containing the data to forget.
-        epsilon: step size for the adversarial perturbation.
-        device: "cuda" or "cpu".
+class Boundary_Shrink(Gradient_Ascent):
+    def __init__(
+        self,
+        model,
+        train_loader,
+        test_loader, 
+        unseen_loader,
+        forget_loader,
+        forget_test_loader,
+        retain_loader,
+        retain_test_loader,
+        optimizer,
+        criteria,
+        num_epoch,
+        epsilon=0.1,
+        device="cuda"
+    ):
+        super().__init__(
+            model=model,
+            train_loader=train_loader,
+            test_loader=test_loader, 
+            unseen_loader=unseen_loader,
+            forget_loader=forget_loader,
+            forget_test_loader=forget_test_loader,
+            retain_loader=retain_loader,
+            retain_test_loader=retain_test_loader,
+            optimizer=optimizer,
+            criteria=criteria,
+            num_epoch=num_epoch,
+            device=device
+        )
+        self.epsilon = epsilon
+
+    def unlearn(self, fa_threshold, ckpt_path):
+        total_unlearn_time = 0.0
         
-    returns:
-        float: the average loss against the adversarial labels.
-    """
-    total_loss = 0.0
-    
-    for batch in forget_loader:
-        # safely extracts images and true labels
-        images = batch[0].to(device)
-        labels = batch[1].to(device)
-        
-        # ==========================================
-        # phase 1: generate adversarial labels
-        # ==========================================
-        # set to eval mode to freeze batchnorm/dropout during attack generation
-        model.eval()
-        
-        # clone images and enable gradient tracking for the input tensor
-        images_adv = images.detach().clone().requires_grad_(True)
-        
-        # forward pass (we call the model directly to keep the computation graph alive)
-        adv_logits, _ = model(images_adv)
-        
-        # calculate loss against true labels to find the gradient direction
-        loss_adv = criteria(adv_logits, labels)
-        
-        # clear any existing gradients, then backpropagate to the input images
-        optimizer.zero_grad() 
-        loss_adv.backward()
-        
-        # extract the sign of the input gradients and create perturbed images (fgsm)
-        grad_sign = images_adv.grad.detach().sign()
-        images_perturbed = images_adv.detach() + epsilon * grad_sign
-        
-        # pass the perturbed images through the network to get the adversarial predictions
-        # we can safely use torch.no_grad() here to save memory
-        with torch.no_grad():
-            perturbed_logits, _ = model(images_perturbed)
-            # get the predicted class indices for the adversarial images
-            adv_labels = torch.argmax(perturbed_logits, dim=1)
+        for epoch in range(self.num_epoch):
+            epoch_start_time = time.time()
+            total_loss = 0.0
             
-        # ==========================================
-        # phase 2: boundary shrink update
-        # ==========================================
-        # clear gradients accumulated during the adversarial backward pass
-        optimizer.zero_grad()
+            for batch in self.forget_loader:
+                images = batch[0].to(self.device)
+                labels = batch[1].to(self.device)
+                
+                # phase 1: generate adversarial labels via fgsm
+                self.model.eval()
+                
+                # clone and track gradients on input images
+                images_adv = images.detach().clone().requires_grad_(True)
+                
+                adv_logits, _ = self.model(images_adv)
+                loss_adv = self.criteria(adv_logits, labels)
+                
+                self.optimizer.zero_grad() 
+                loss_adv.backward()
+                
+                # compute image perturbations
+                grad_sign = images_adv.grad.detach().sign()
+                images_perturbed = images_adv.detach() + self.epsilon * grad_sign
+                
+                with torch.no_grad():
+                    perturbed_logits, _ = self.model(images_perturbed)
+                    adv_labels = torch.argmax(perturbed_logits, dim=1)
+                    
+                # phase 2: boundary shrink update
+                self.optimizer.zero_grad()
+                
+                ori_logits, _ = self.model.forward_with_grad(images)
+                loss = self.criteria(ori_logits, adv_labels.detach())
+                
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                
+            avg_loss = total_loss / len(self.forget_loader)
+            epoch_time = time.time() - epoch_start_time
+            total_unlearn_time += epoch_time
+            
+            print(f"[*] evaluating epoch {epoch+1}...")
+            fa_score, ra_score, ta_score, mia_score = self.evaluate()
+            
+            print(f"--> Epoch [{epoch+1}/{self.num_epoch}] | Time: {epoch_time:.2f}s | Loss: {avg_loss:.4f}")
+            print(f"--> Metrics: RA: {ra_score*100:.2f}% | FA: {fa_score*100:.2f}% | TA: {ta_score*100:.2f}% | MIA: {mia_score:.4f}")
+            print("-" * 40)
+            
+            wandb.log({
+                "epoch": epoch+1, 
+                "unlearn_loss": avg_loss, 
+                "ra": ra_score, 
+                "fa": fa_score, 
+                "ta": ta_score, 
+                "mia": mia_score
+            })
+            
+            torch.save(self.model.state_dict(), f"{ckpt_path}_epoch_{epoch+1}.pt")
+            
+            if fa_score <= fa_threshold:
+                print(f"[*] early stopping triggered at epoch {epoch+1} (FA <= {fa_threshold})")
+                break
         
-        # forward pass original images (uses your forward_with_grad to set train mode)
-        ori_logits, _ = model.forward_with_grad(images)
-        
-        # calculate the loss forcing the original images to map to the adversarial labels
-        loss = criteria(ori_logits, adv_labels.detach())
-        
-        # update the model weights
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-    avg_loss = total_loss / len(forget_loader)
-    return avg_loss
+        peak_memory_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        wandb.log({
+            "total_train_time_sec": total_unlearn_time,
+            "peak_memory_gb": peak_memory_gb
+        })
+
+        torch.save(self.model.state_dict(), f"{ckpt_path}.pt")
+        return total_unlearn_time

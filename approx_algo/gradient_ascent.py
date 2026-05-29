@@ -1,47 +1,166 @@
+import os
+import time
 import torch
+import wandb
 
-def gradient_ascent(model, criteria, optimizer, forget_loader, device="cuda"):
-    """
-    performs gradient ascent on the forget_set to make the model "unlearn" data.
+from metric.fa import forget_acc
+from metric.ra import retain_acc
+from metric.ta import test_acc
+from metric.mia import mia
+
+class Gradient_Ascent:
+    def __init__(
+        self,
+        model,
+        train_loader,
+        test_loader, 
+        unseen_loader,
+        forget_loader,
+        forget_test_loader,
+        retain_loader,
+        retain_test_loader,
+        optimizer,
+        criteria,
+        num_epoch,
+        device="cuda"
+    ):
+        # verify model compatibility
+        actual_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        supported_models = ['DeiTArchitecture', 'ResNetArchitecture', 'ModuleArchitecture']
+        if actual_model.__class__.__name__ not in supported_models:
+            raise TypeError(f"Gradient_Ascent does not support {model.__class__.__name__}. Supported: {supported_models}")
+        
+        self.model = model
+        
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+        self.unseen_loader = unseen_loader
+
+        self.forget_loader = forget_loader
+        self.forget_test_loader = forget_test_loader
+
+        self.retain_loader = retain_loader
+        self.retain_test_loader = retain_test_loader
+
+        self.optimizer = optimizer
+        self.criteria = criteria
+
+        self.num_epoch = num_epoch
+        self.device = device
+        
+    def learn(self, ckpt_path):
+        self.model.train()
+        total_train_time = 0.0
+        
+        for epoch in range(self.num_epoch):
+            total_loss = 0.0
+            epoch_start_time = time.time()
+            
+            for batch in self.train_loader:
+                images = batch[0].to(self.device)
+                labels = batch[1].to(self.device)
+                
+                self.optimizer.zero_grad()
+                logits, _ = self.model.forward_with_grad(images)
+                loss = self.criteria(logits, labels)
+                
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+                
+            epoch_train_time = time.time() - epoch_start_time
+            total_train_time += epoch_train_time
+                
+            avg_loss = total_loss / len(self.train_loader)
+            fa_score, ra_score, ta_score, mia_score = self.evaluate()
+
+            print(f"epoch [{epoch+1}/{self.num_epoch}] | loss: {avg_loss:.4f} | "
+                  f"ra: {ra_score*100:.2f}% | fa: {fa_score*100:.2f}% | "
+                  f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f} | time: {epoch_train_time:.2f}s")
+            
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss": avg_loss,
+                "retain_accuracy": ra_score,
+                "forget_accuracy": fa_score,
+                "test_accuracy": ta_score,
+                "mia_score": mia_score
+            })
+
+            torch.save(self.model.state_dict(), f"{ckpt_path}_epoch_{epoch+1}.pt")
+
+        peak_memory_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        wandb.log({
+            "total_train_time_sec": total_train_time,
+            "peak_memory_gb": peak_memory_gb
+        })
+
+        torch.save(self.model.state_dict(), f"{ckpt_path}.pt")
+        return total_train_time
+
+    def unlearn(self, fa_threshold, ckpt_path):
+        self.model.train()
+        total_unlearn_time = 0.0
+        
+        for epoch in range(self.num_epoch):
+            epoch_start_time = time.time()
+            total_loss = 0.0
+            
+            for batch in self.forget_loader:
+                images = batch[0].to(self.device)
+                labels = batch[1].to(self.device)
+                
+                self.optimizer.zero_grad()
+                logits, _ = self.model.forward_with_grad(images)
+                loss = self.criteria(logits, labels)
+                
+                # reverses the loss sign to perform gradient ascent
+                # the optimizer will try to minimize (-loss), which effectively maximizes the actual (loss)
+                ascent_loss = -loss
+                ascent_loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                
+            avg_loss = total_loss / len(self.forget_loader)
+            epoch_time = time.time() - epoch_start_time
+            total_unlearn_time += epoch_time
+            
+            print(f"[*] evaluating epoch {epoch+1}...")
+            fa_score, ra_score, ta_score, mia_score = self.evaluate()
+            
+            print(f"--> Epoch [{epoch+1}/{self.num_epoch}] | Time: {epoch_time:.2f}s | Loss: {avg_loss:.4f}")
+            print(f"--> Metrics: RA: {ra_score*100:.2f}% | FA: {fa_score*100:.2f}% | TA: {ta_score*100:.2f}% | MIA: {mia_score:.4f}")
+            print("-" * 40)
+            
+            wandb.log({
+                "epoch": epoch+1, 
+                "unlearn_loss": avg_loss, 
+                "ra": ra_score, 
+                "fa": fa_score, 
+                "ta": ta_score, 
+                "mia": mia_score
+            })
+            
+            torch.save(self.model.state_dict(), f"{ckpt_path}_epoch_{epoch+1}.pt")
+            
+            if fa_score <= fa_threshold:
+                print(f"[*] early stopping triggered at epoch {epoch+1} (FA <= {fa_threshold})")
+                break
     
-    args:
-        model: architecture inherited from BaseArchitecture.
-        criteria: loss function (e.g., nn.CrossEntropyLoss()).
-        optimizer: PyTorch optimizer (e.g., Adam, SGD).
-        forget_loader: DataLoader containing the data to forget.
-        device: "cuda" or "cpu".
+        peak_memory_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        wandb.log({
+            "total_train_time_sec": total_unlearn_time,
+            "peak_memory_gb": peak_memory_gb
+        })
+
+        torch.save(self.model.state_dict(), f"{ckpt_path}.pt")
+        return total_unlearn_time
+
+    def evaluate(self):
+        fa_score = forget_acc(self.model, self.forget_test_loader, self.device)
+        ra_score = retain_acc(self.model, self.retain_test_loader, self.device)
+        ta_score = test_acc(self.model, self.test_loader, self.device)
+        mia_score = mia(self.model, self.unseen_loader, self.forget_test_loader, self.device)
         
-    returns:
-        float: the average original loss (positive value) on the forget_set.
-    """
-    # ensure the model is in train mode
-    model.train()
-    
-    total_loss = 0.0
-    
-    for batch in forget_loader:
-        # safely extracts images and labels, ignoring domains if they are present in the batch
-        images = batch[0].to(device)
-        labels = batch[1].to(device)
-        
-        # clears the gradients from the previous step
-        optimizer.zero_grad()
-        
-        # performs the forward pass to get logits and features
-        logits, features = model.forward_with_grad(images)
-        
-        # calculates the original loss
-        loss = criteria(logits, labels)
-        
-        # reverses the loss sign to perform gradient ascent.
-        # the optimizer will try to minimize (-loss), which effectively maximizes the actual (loss).
-        ascent_loss = -loss
-        
-        # performs backpropagation and updates the weights
-        ascent_loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-    avg_loss = total_loss / len(forget_loader)
-    return avg_loss
+        return fa_score, ra_score, ta_score, mia_score

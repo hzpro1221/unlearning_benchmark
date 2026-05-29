@@ -2,7 +2,7 @@ import torch
 
 def forget_acc(model, forget_loader, device="cuda"):
     """
-    calculates the accuracy of the model on the forget_set (or any other dataloader).
+    calculates the accuracy of the model on a given dataloader.
     
     args:
         model: architecture inherited from BaseArchitecture.
@@ -10,26 +10,22 @@ def forget_acc(model, forget_loader, device="cuda"):
         device: "cuda" or "cpu".
         
     returns:
-        float: the accuracy as a ratio (between 0.0 and 1.0).
+        float: accuracy as a ratio (0.0 to 1.0).
     """
     correct = 0
     total = 0
     
     for batch in forget_loader:
-        # safely extracts images and true labels, ignoring domains if present
+        # extract images and true labels
         images = batch[0].to(device)
         labels = batch[1].to(device)
         
-        # use the inference method which automatically sets eval() and no_grad()
-        # we only need the logits for accuracy, so we ignore the features
+        # inference automatically handles eval() and no_grad()
         logits, _ = model.inference(images)
         
-        # get the predicted class indices
         predictions = torch.argmax(logits, dim=1)
         
-        # count correct predictions
         correct += (predictions == labels).sum().item()
         total += labels.size(0)
         
-    accuracy = correct / total
-    return accuracy
+    return correct / total

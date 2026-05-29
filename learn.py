@@ -24,16 +24,14 @@ from dataset.transform.unseen_transform import get_unseen_transform
 
 from architecture.deity import DeiTArchitecture
 from architecture.resnet import ResNetArchitecture
-from architecture.module import ModuleArchitecture, DeepMoELayer
+from architecture.module import ModuleArchitecture
 
-from metric.fa import forget_acc
-from metric.ra import retain_acc
-from metric.ta import test_acc
-from metric.mia import mia
+from approx_algo.gradient_ascent import Gradient_Ascent
+from approx_algo.module import Module
 
 
 class ApplyTransform(Dataset):
-    """Applies transforms to a subset, enforcing a base 224x224 resize for ViT/ResNet compatibility."""
+    """applies transforms to a subset, enforcing a base 224x224 resize for vit/resnet compatibility."""
     def __init__(self, subset, transform=None):
         self.subset = subset
         self.transform = transform
@@ -42,10 +40,8 @@ class ApplyTransform(Dataset):
     def __getitem__(self, idx):
         data = self.subset[idx]
         image = self.resize(data[0])
-        
         if self.transform:
             image = self.transform(image)
-            
         return (image,) + data[1:]
 
     def __len__(self):
@@ -62,7 +58,7 @@ def set_seed(seed):
 
 
 def get_domain(dataset, idx):
-    """Safely extracts domain labels regardless of dataset tuple structure."""
+    """safely extracts domain labels regardless of dataset tuple structure."""
     if hasattr(dataset, 'domains'):
         return dataset.domains[idx]
     
@@ -97,6 +93,7 @@ def main():
         settings=wandb.Settings(start_method='thread')
     )
 
+    # load dataset
     if args.dataset == 'pacs':
         full_dataset = PACSDataset(root_dir=args.data_dir, transform=None)
         num_classes = 7
@@ -112,7 +109,7 @@ def main():
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
-    # Primary Split
+    # primary split
     total_size = len(full_dataset)
     train_size = int(0.8 * total_size)
     test_size = int(0.1 * total_size)
@@ -123,7 +120,7 @@ def main():
         full_dataset, [train_size, test_size, unseen_size], generator=generator
     )
 
-    # Secondary Split (Unlearning Target Identification)
+    # secondary split 
     unlearn_setting = getattr(args, 'unlearn_setting', 'random')
     
     if unlearn_setting == 'random':
@@ -155,18 +152,17 @@ def main():
     else:
         raise ValueError("unlearn_setting must be 'random', 'class', or 'domain'")
 
-    train_set = ApplyTransform(train_subset, transform=get_train_transform())
-    forget_eval_set = ApplyTransform(forget_subset, transform=get_forget_test_transform())
-    retain_eval_set = ApplyTransform(retain_subset, transform=get_retain_test_transform())
-    test_set = ApplyTransform(final_test_subset, transform=get_test_transform())
-    unseen_set = ApplyTransform(unseen_subset, transform=get_unseen_transform())
+    # prepare dataloaders
+    train_loader = DataLoader(ApplyTransform(train_subset, get_train_transform()), batch_size=args.batch_size, shuffle=True, num_workers=4)
+    forget_train_loader = DataLoader(ApplyTransform(forget_subset, get_train_transform()), batch_size=args.batch_size, shuffle=True, num_workers=4)
+    retain_train_loader = DataLoader(ApplyTransform(retain_subset, get_train_transform()), batch_size=args.batch_size, shuffle=True, num_workers=4)
+    
+    forget_test_loader = DataLoader(ApplyTransform(forget_subset, get_forget_test_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
+    retain_test_loader = DataLoader(ApplyTransform(retain_subset, get_retain_test_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
+    test_loader = DataLoader(ApplyTransform(final_test_subset, get_test_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
+    unseen_loader = DataLoader(ApplyTransform(unseen_subset, get_unseen_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    forget_eval_loader = DataLoader(forget_eval_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    retain_eval_loader = DataLoader(retain_eval_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    unseen_loader = DataLoader(unseen_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
+    # model initialization
     if 'resnet' in args.model_name:
         model = ResNetArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
     elif 'deit' in args.model_name:
@@ -181,201 +177,50 @@ def main():
             expert_hidden_ratio=args.expert_hidden_ratio,
             gate_k=args.gate_k,
             device=device
-            )
+        )
         model._set_grad_mode("learning")
-
         model = torch.compile(model)
     else:
         raise ValueError(f"Unsupported model prefix for {args.model_name}")
 
-    if 'resnet' in args.model_name or 'deit' in args.model_name:
-        criteria = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    criteria = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-        total_train_time = 0.0
+    # unified arguments for wrappers
+    algo_kwargs = {
+        "model": model,
+        "train_loader": train_loader,
+        "test_loader": test_loader,
+        "unseen_loader": unseen_loader,
+        "forget_loader": forget_train_loader,
+        "forget_test_loader": forget_test_loader,
+        "retain_loader": retain_train_loader,
+        "retain_test_loader": retain_test_loader,
+        "optimizer": optimizer,
+        "criteria": criteria,
+        "num_epoch": args.epochs,
+        "device": device
+    }
 
-        for epoch in range(args.epochs):
-            model.train()
-            total_loss = 0.0
-            
-            epoch_start_time = time.time()
-            
-            for batch in train_loader:
-                images = batch[0].to(device)
-                labels = batch[1].to(device)
-                
-                optimizer.zero_grad()
-                logits, _ = model.forward_with_grad(images)
-                loss = criteria(logits, labels)
-                
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                
-            epoch_train_time = time.time() - epoch_start_time
-            total_train_time += epoch_train_time
-                
-            avg_loss = total_loss / len(train_loader)
-            
-            fa_score = forget_acc(model, forget_eval_loader, device)
-            ra_score = retain_acc(model, retain_eval_loader, device)
-            ta_score = test_acc(model, test_loader, device)
-            mia_score = mia(model=model, unseen_loader=unseen_loader, forget_loader=forget_eval_loader, device=device)
-            
-            print(f"epoch [{epoch+1}/{args.epochs}] | loss: {avg_loss:.4f} | "
-                f"ra: {ra_score*100:.2f}% | fa: {fa_score*100:.2f}% | "
-                f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f} | time: {epoch_train_time:.2f}s")
-            
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": avg_loss,
-                "retain_accuracy": ra_score,
-                "forget_accuracy": fa_score,
-                "test_accuracy": ta_score,
-                "mia_score": mia_score
-            })
-            
-            torch.save(model.state_dict(), os.path.join(args.output_dir, f"{yaml_filename}_epoch_{epoch+1}.pt"))
-    # the criteria for module is specific designed, different to which for resnet or deit
-    elif 'module' in args.model_name:
-        # --- Balance Loss EMA Setup ---
-        # Activate EMA if the batch size is 8 or smaller
-        use_ema = args.batch_size <= 8
-        ema_states = {}
+    ckpt_prefix = os.path.join(args.output_dir, yaml_filename)
+    print(f"\n[*] Starting Base Training Phase")
+
+    if 'module' in args.model_name:
+        algo_wrapper = Module(
+            **algo_kwargs,
+            lambda_sparse=getattr(args, 'lambda_sparse', 1.0),
+            lambda_balance=getattr(args, 'lambda_balance', 1.0),
+            lambda_div=getattr(args, 'lambda_div', 1.0),
+            # dummy unlearn to prevent error
+            alpha=1.0, beta=1.0, gamma=1.0, eta=1.0, k_u=2 
+        )
         ema_alpha = getattr(args, 'ema_alpha', 0.9)
+        algo_wrapper.learn(ckpt_path=ckpt_prefix, ema_alpha=ema_alpha)
+    else:
+        # standard training loop 
+        algo_wrapper = Gradient_Ascent(**algo_kwargs)
+        algo_wrapper.learn(ckpt_path=ckpt_prefix)
 
-        def loss_sparse(pi):
-            entropy = -(pi * (pi + 1e-8).log()).sum(dim=-1)
-            return entropy.mean()
-
-        def loss_balance(pi, module_name):
-            M = pi.size(-1)
-            mean_pi = pi.mean(dim=0) 
-            
-            if use_ema:
-                if module_name not in ema_states:
-                    ema_states[module_name] = torch.ones_like(mean_pi) / M
-                effective_pi = ema_alpha * ema_states[module_name] + (1 - ema_alpha) * mean_pi
-                
-                ema_states[module_name] = effective_pi.detach()
-            else:
-                effective_pi = mean_pi
-
-            return ((effective_pi - 1.0 / M) ** 2).sum()
-
-        def loss_diversity(h_stack, eps=1e-6):
-            B, M, r = h_stack.shape
-            
-            if M < 2: 
-                return h_stack.new_zeros(())
-            
-            loss = h_stack.new_zeros(1).squeeze()
-            
-            H_tilde = []
-            for m in range(M):
-                H_m = h_stack[:, m, :]  # Shape: (B, r)
-
-                norm_F = H_m.norm(p='fro').clamp(min=eps)
-                
-                # H_tilde_m = H_m / (||H_m||_F + eps)
-                H_tilde_m = H_m / norm_F
-                H_tilde.append(H_tilde_m)
-            for m in range(M):
-                for n in range(M):
-                    if m == n: 
-                        continue
-
-                    # Cross-correlation matrix: (H_tilde_m^T @ H_tilde_n)
-                    C = (H_tilde[m].T @ H_tilde[n])
-                    loss += (C ** 2).sum()
-            return loss
-        
-        # lambda for losses
-        lambda_sparse = args.lambda_sparse
-        lambda_balance = args.lambda_balance
-        lambda_div = args.lambda_div
-
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-        criteria = nn.CrossEntropyLoss()
-        total_train_time = 0.0
-
-        for epoch in range(args.epochs):
-            model.train()
-            epoch_start_time = time.time() 
-            
-            running_total, running_ce, running_sp, running_bal, running_div = 0.0, 0.0, 0.0, 0.0, 0.0
-
-            for batch in train_loader:
-                images = batch[0].to(device)
-                labels = batch[1].to(device)
-                
-                optimizer.zero_grad()
-                logits, _ = model.forward_with_grad(images)
-                
-                all_pi, all_h, moe_names = [], [], []
-                for name, module in model.featurizer.model.named_modules():
-                    if isinstance(module, DeepMoELayer):
-                        all_pi.append(module.last_pi)
-                        all_h.append(module.last_h)
-                        moe_names.append(name) 
-
-                ce_loss = criteria(logits, labels)
-                sp_loss = sum([loss_sparse(pi) for pi in all_pi]) / len(all_pi)
-                bal_loss = sum([loss_balance(pi, n) for pi, n in zip(all_pi, moe_names)]) / len(all_pi)
-                div_loss = sum([loss_diversity(h) for h in all_h]) / len(all_h)
-                
-                t_loss = ce_loss + (args.lambda_sparse * sp_loss) + (args.lambda_balance * bal_loss) + (args.lambda_div * div_loss)
-
-                t_loss.backward()
-                optimizer.step()
-                
-                running_total += t_loss.item()
-                running_ce += ce_loss.item()
-                running_sp += sp_loss.item()
-                running_bal += bal_loss.item()
-                running_div += div_loss.item()
-
-            epoch_train_time = time.time() - epoch_start_time
-            total_train_time += epoch_train_time
-            
-            num_batches = len(train_loader)
-            avg_loss = running_total / num_batches
-            avg_ce = running_ce / num_batches 
-            avg_sp = running_sp / num_batches 
-            avg_bal = running_bal / num_batches 
-            avg_div = running_div / num_batches 
-            
-            fa_score = forget_acc(model, forget_eval_loader, device)
-            ra_score = retain_acc(model, retain_eval_loader, device)
-            ta_score = test_acc(model, test_loader, device)
-            mia_score = mia(model=model, unseen_loader=unseen_loader, forget_loader=forget_eval_loader, device=device)
-            
-            print(f"epoch [{epoch+1}/{args.epochs}] | "
-              f"total_loss: {avg_loss:.4f} (ce: {avg_ce:.4f}, sp: {avg_sp:.4f}, bal: {avg_bal:.4f}, div: {avg_div:.4f}) | "
-              f"ra: {ra_score*100:.2f}% | fa: {fa_score*100:.2f}% | "
-              f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f} | time: {epoch_train_time:.2f}s")
-            
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": avg_loss,
-                "ce_loss": running_ce / num_batches,
-                "retain_accuracy": ra_score,
-                "forget_accuracy": fa_score,
-                "test_accuracy": ta_score,
-                "mia_score": mia_score
-            })
-            
-            torch.save(model.state_dict(), os.path.join(args.output_dir, f"{yaml_filename}_epoch_{epoch+1}.pt"))
-
-    peak_memory_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
-        
-    wandb.log({
-        "total_train_time_sec": total_train_time,
-        "peak_memory_gb": peak_memory_gb
-    })
-
-    save_path = os.path.join(args.output_dir, f"{yaml_filename}.pt")
-    torch.save(model.state_dict(), save_path)
     wandb.finish()
 
 if __name__ == "__main__":

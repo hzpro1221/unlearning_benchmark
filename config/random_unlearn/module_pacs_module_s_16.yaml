@@ -7,7 +7,7 @@ expert_depth: 2
 expert_hidden_ratio: 0.10
 gate_k: 2
 pretrained: true
-pretrained_model_path: "checkpoint/learn/pacs_random_10_module_s_16/pacs_random_10_module_s_16_epoch_6.pt"
+pretrained_model_path: "checkpoint/learn/pacs_random_10_module_s_16/pacs_random_10_module_s_16_epoch_14.pt"
 
 unlearn_algo: "module_unlearn_algo"
 unlearn_setting: "random"
@@ -20,6 +20,6 @@ k_u: 2
 
 epochs: 50
 batch_size: 32
-lr: 2.0e-4
+lr: 3.0e-2
 fa_threshold: 0.8 
 seed: 42
