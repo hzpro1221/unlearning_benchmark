@@ -1,3 +1,4 @@
+# main script for the unlearning pipeline
 import os
 import argparse
 import random
@@ -35,6 +36,7 @@ from approx_algo.random_labeling import Random_Labeling
 from approx_algo.boundary_shrink import Boundary_Shrink
 from approx_algo.finetune import Finetune
 from approx_algo.module import Module
+from approx_algo.scrub import SCRUB  
 
 class ApplyTransform(Dataset):
     def __init__(self, subset, transform=None):
@@ -251,6 +253,8 @@ def main():
         algo_wrapper = Random_Labeling(**algo_kwargs)
     elif unlearn_algo == 'boundary_shrink':
         algo_wrapper = Boundary_Shrink(**algo_kwargs, epsilon=getattr(args, 'epsilon', 0.1))
+    elif unlearn_algo == 'scrub':  
+        algo_wrapper = SCRUB(**algo_kwargs, alpha=getattr(args, 'alpha', 0.1))
     elif unlearn_algo in ['module', 'module_unlearn_algo']:
         algo_wrapper = Module(
             **algo_kwargs,
@@ -277,5 +281,6 @@ def main():
     print(f"[*] final model saved to {ckpt_prefix}.pt")
     
     wandb.finish()
+
 if __name__ == "__main__":
     main()

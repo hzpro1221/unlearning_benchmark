@@ -5,7 +5,7 @@ model_name: "deit_small_patch16_224"
 pretrained: true
 pretrained_model_path: "checkpoint/learn/pacs_random_10_deit_s_16/pacs_random_10_deit_s_16_epoch_5.pt"
 
-unlearn_algo: "ga"
+unlearn_algo: "scrub"
 unlearn_setting: "random"
 forget_ratio: 0.10  
 
