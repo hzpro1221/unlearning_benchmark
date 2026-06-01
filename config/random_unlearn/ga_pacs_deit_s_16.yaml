@@ -11,7 +11,7 @@ forget_ratio: 0.10
 
 epochs: 50
 batch_size: 32
-# lr: 5.0e-7
-lr: 3.0e-3
+lr: 5.0e-7
+# lr: 3.0e-3
 fa_threshold: 0.8 
 seed: 42
