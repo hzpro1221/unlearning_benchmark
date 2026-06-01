@@ -5,13 +5,13 @@ model_name: "deit_small_patch16_224"
 pretrained: true
 pretrained_model_path: "checkpoint/learn/pacs_random_10_deit_s_16/pacs_random_10_deit_s_16_epoch_5.pt"
 
-unlearn_algo: "scrub"
+unlearn_algo: "sg_unlearn"
 unlearn_setting: "random"
 forget_ratio: 0.10  
 
 epochs: 50
 batch_size: 32
-lr: 5.0e-7
+lr: 3.0e-5
 # lr: 3.0e-3
 fa_threshold: 0.8 
 seed: 42

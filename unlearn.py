@@ -37,6 +37,7 @@ from approx_algo.boundary_shrink import Boundary_Shrink
 from approx_algo.finetune import Finetune
 from approx_algo.module import Module
 from approx_algo.scrub import SCRUB  
+from approx_algo.sg_unlearn import SG_Unlearning # <-- Added SG_Unlearning import
 
 class ApplyTransform(Dataset):
     def __init__(self, subset, transform=None):
@@ -255,6 +256,8 @@ def main():
         algo_wrapper = Boundary_Shrink(**algo_kwargs, epsilon=getattr(args, 'epsilon', 0.1))
     elif unlearn_algo == 'scrub':  
         algo_wrapper = SCRUB(**algo_kwargs, alpha=getattr(args, 'alpha', 0.1))
+    elif unlearn_algo in ['sg_unlearn', 'sg_unlearning']:
+        algo_wrapper = SG_Unlearning(**algo_kwargs, alpha=getattr(args, 'alpha', 0.1)) 
     elif unlearn_algo in ['module', 'module_unlearn_algo']:
         algo_wrapper = Module(
             **algo_kwargs,
