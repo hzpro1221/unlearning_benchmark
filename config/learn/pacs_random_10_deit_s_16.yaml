@@ -1,13 +1,15 @@
 dataset: "pacs"
 data_dir: "./dataset/data_folder/pacs"
 
-model_name: "deit_small_patch16_224"
+model_name: "erm_ktp_resnet50"
+lambda_2: 1.0e-3
+lambda_3: 1.0e-3
 pretrained: true
 
-unlearn_setting: "random"
-forget_ratio: 0.10  
+unlearn_setting: "class"
+forget_classes: [0]
 
-epochs: 5
+epochs: 100
 batch_size: 32
 lr: 5.0e-4
 seed: 42

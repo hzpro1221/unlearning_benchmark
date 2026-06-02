@@ -25,9 +25,11 @@ from dataset.transform.unseen_transform import get_unseen_transform
 from architecture.deity import DeiTArchitecture
 from architecture.resnet import ResNetArchitecture
 from architecture.module import ModuleArchitecture
+from architecture.erm_ktp_resnet import ERM_KTP_Resnet
 
 from approx_algo.gradient_ascent import Gradient_Ascent
 from approx_algo.module import Module
+from approx_algo.erm_ktp import ERM_KTP
 
 
 class ApplyTransform(Dataset):
@@ -84,6 +86,17 @@ def main():
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
+
+    unlearn_setting = getattr(args, 'unlearn_setting', 'random')
+
+    # fail fast constraint for erm-ktp
+    if 'erm_ktp' in getattr(args, 'model_name', '').lower() and unlearn_setting != 'class':
+        raise ValueError(
+            f"\n[ERROR] Mathematical Constraint Violated:\n"
+            f"ERM-KTP relies on severing class-specific feature channels.\n"
+            f"It is strictly applicable only for `unlearn_setting: 'class'`.\n"
+            f"Your current config uses: '{unlearn_setting}'."
+        )
     
     wandb.login(key="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")
     wandb.init(
@@ -121,8 +134,6 @@ def main():
     )
 
     # secondary split 
-    unlearn_setting = getattr(args, 'unlearn_setting', 'random')
-    
     if unlearn_setting == 'random':
         forget_size = int(getattr(args, 'forget_ratio', 0.1) * train_size)
         forget_subset, retain_subset = random_split(
@@ -163,7 +174,16 @@ def main():
     unseen_loader = DataLoader(ApplyTransform(unseen_subset, get_unseen_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # model initialization
-    if 'resnet' in args.model_name:
+    if 'erm_ktp_resnet' in args.model_name:
+        backbone_name = args.model_name.replace('erm_ktp_', '')
+        model = ERM_KTP_Resnet(
+            model_name=backbone_name, 
+            num_classes=num_classes, 
+            pretrained=args.pretrained,
+            alpha_ratio=getattr(args, 'alpha_ratio', 0.1),
+            device=device
+        )
+    elif 'resnet' in args.model_name:
         model = ResNetArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
     elif 'deit' in args.model_name:
         model = DeiTArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
@@ -216,6 +236,18 @@ def main():
         )
         ema_alpha = getattr(args, 'ema_alpha', 0.9)
         algo_wrapper.learn(ckpt_path=ckpt_prefix, ema_alpha=ema_alpha)
+    elif 'erm_ktp' in args.model_name:
+        algo_wrapper = ERM_KTP(
+            **algo_kwargs,
+            forget_classes=getattr(args, 'forget_classes', [0]),
+            lambda_1=getattr(args, 'lambda_1', 1.0),
+            lambda_2=getattr(args, 'lambda_2', 1.0),
+            lambda_3=getattr(args, 'lambda_3', 0.1),
+            warmup_epochs=getattr(args, 'warmup_epochs', 1),
+            mask_period=getattr(args, 'mask_period', 2),
+            mask_epoch_min=getattr(args, 'mask_epoch_min', 1)
+        )
+        algo_wrapper.learn(ckpt_path=ckpt_prefix)
     else:
         # standard training loop 
         algo_wrapper = Gradient_Ascent(**algo_kwargs)

@@ -24,12 +24,6 @@ class Gradient_Ascent:
         num_epoch,
         device="cuda"
     ):
-        # verify model compatibility
-        actual_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-        supported_models = ['DeiTArchitecture', 'ResNetArchitecture', 'ModuleArchitecture']
-        if actual_model.__class__.__name__ not in supported_models:
-            raise TypeError(f"Gradient_Ascent does not support {model.__class__.__name__}. Supported: {supported_models}")
-        
         self.model = model
         
         self.train_loader = train_loader
