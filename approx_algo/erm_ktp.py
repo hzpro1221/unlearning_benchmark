@@ -139,34 +139,24 @@ class ERM_KTP(Gradient_Ascent):
         return total_train_time
 
     def execute_FKT_and_GKT(self, model_T, model_S):
-        """
-        direct knowledge transfer for fully connected layers and mask matrix.
-        fkt severs the physical connections between forget class features and predictions.
-        gkt updates the unlearned model's mask to permanently block those features.
-        """
         with torch.no_grad():
             bar_Gc = model_T.featurizer.lmask.get_bar_Gc(self.forget_classes)
             
-            # --- FKT (Eq. 12) ---
-            # build A_beta: C columns containing transposed bar_Gc to mask specific channels
+            # --- FKT ---
             A_beta = bar_Gc.expand(model_S.num_classes, -1).to(self.device)
             
-            # build A_gamma: zeros out bias for forget classes
             A_gamma = torch.ones(model_S.num_classes).to(self.device)
             for c in self.forget_classes:
                 A_gamma[c] = 0.0
             
-            # apply hadamard product to transfer severed knowledge to student
             model_S.classifier_head.weight.data = model_T.classifier_head.weight.data * A_beta
             if model_S.classifier_head.bias is not None:
                 model_S.classifier_head.bias.data = model_T.classifier_head.bias.data * A_gamma
                 
-            # freeze student classifier to prevent relearning severed connections
             for param in model_S.classifier_head.parameters():
                 param.requires_grad = False
 
-            # --- GKT (Eq. 13) ---
-            # build A_G: zeroes out the forget class rows in the mask matrix
+            # --- GKT ---
             A_G = torch.ones_like(model_T.featurizer.lmask.mask).to(self.device)
             for c in self.forget_classes:
                 A_G[:, c] = 0.0
@@ -175,24 +165,18 @@ class ERM_KTP(Gradient_Ascent):
             model_S.featurizer.lmask.mask.requires_grad = False 
 
     def unlearn(self, fa_threshold, ckpt_path):
-        """
-        channel knowledge transfer (ckt). 
-        optimizes the last convolution layer and pooled outputs of the student model 
-        to match the teacher model on retain data. the student's output is masked 
-        by bar_Gc (prohibiting forget channels), while the teacher's output remains unmasked.
-        """
         total_unlearn_time = 0.0
         
-        # 1. setup teacher model (frozen)
+        # setup teacher model (frozen)
         model_T = copy.deepcopy(self.model)
         model_T.eval()
         for param in model_T.parameters():
             param.requires_grad = False
             
-        # 2. setup student model (self.model)
+        # setup student model (self.model)
         model_S = self.model
         
-        # apply fkt and gkt instantly before feature training
+        # apply fkt and gkt before feature training
         self.execute_FKT_and_GKT(model_T, model_S)
         
         model_S.train()
@@ -207,26 +191,24 @@ class ERM_KTP(Gradient_Ascent):
             epoch_start_time = time.time()
             total_loss = 0.0
             
-            # --- CKT (Eq. 11) ---
+            # --- CKT ---
             for batch in self.retain_loader:
                 images = batch[0].to(self.device)
                 optimizer_CKT.zero_grad()
                 
-                # 1. teacher forward: f(x; theta_T) -> UNMASKED
+                # teacher forward: f(x; theta_T) 
                 with torch.no_grad():
                     f_T_conv = model_T.featurizer.feature_extractor(images)
                     f_T_pooled = torch.flatten(model_T.featurizer.avgpool(f_T_conv), 1)
                 
-                # 2. student forward: g(x; theta_S) -> MASKED by ¯Gc
+                # student forward: g(x; theta_S) * ¯Gc
                 g_S_conv = model_S.featurizer.feature_extractor(images)
                 
-                # apply ¯Gc to the student's convolutional output
                 g_S_masked = model_S.featurizer.lmask.channel_express(g_S_conv, self.forget_classes)
                 
-                # apply the same logic to the pooled output (as implemented by the original authors)
                 g_S_pooled = torch.flatten(model_S.featurizer.avgpool(g_S_masked), 1)
                 
-                # 3. calculate mse loss (Eq. 11): MSE(f(x), g(x) ◦ ¯Gc)
+                # mse loss: MSE(f(x), g(x) * ¯Gc)
                 loss_conv = F.mse_loss(g_S_masked, f_T_conv.detach())
                 loss_pool = F.mse_loss(g_S_pooled, f_T_pooled.detach())
                 
