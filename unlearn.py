@@ -1,4 +1,3 @@
-# main script for the unlearning pipeline
 import os
 import argparse
 import random
@@ -30,6 +29,7 @@ from architecture.deity import DeiTArchitecture
 from architecture.resnet import ResNetArchitecture
 from architecture.module import ModuleArchitecture
 from architecture.erm_ktp_resnet import ERM_KTP_Resnet 
+from architecture.asu_deity import ASUDeiTArchitecture  
 
 from approx_algo.gradient_ascent import Gradient_Ascent
 from approx_algo.l1_sparse import L1_Sparse
@@ -41,6 +41,7 @@ from approx_algo.scrub import SCRUB
 from approx_algo.sg_unlearn import SG_Unlearning 
 from approx_algo.boundary_expanding import Boundary_Expanding 
 from approx_algo.erm_ktp import ERM_KTP 
+from approx_algo.asu import ASU  
 
 class ApplyTransform(Dataset):
     def __init__(self, subset, transform=None):
@@ -220,6 +221,8 @@ def main():
             alpha_ratio=getattr(args, 'alpha_ratio', 0.1),
             device=device
         )
+    elif 'asu_deit' in args.model_name:
+        model = ASUDeiTArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=False, device=device)
     elif 'resnet' in args.model_name:
         model = ResNetArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=False, device=device)
     elif 'deit' in args.model_name:
@@ -290,6 +293,12 @@ def main():
             warmup_epochs=getattr(args, 'warmup_epochs', 0),
             mask_period=getattr(args, 'mask_period', 3),
             mask_epoch_min=getattr(args, 'mask_epoch_min', 2)
+        )
+    elif unlearn_algo == 'asu':
+        algo_wrapper = ASU(
+            **algo_kwargs,
+            tau=getattr(args, 'tau', 5.0),
+            support_weight=getattr(args, 'support_weight', 1.0)
         )
     elif unlearn_algo in ['module', 'module_unlearn_algo']:
         algo_wrapper = Module(

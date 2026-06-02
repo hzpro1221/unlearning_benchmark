@@ -26,6 +26,7 @@ from architecture.deity import DeiTArchitecture
 from architecture.resnet import ResNetArchitecture
 from architecture.module import ModuleArchitecture
 from architecture.erm_ktp_resnet import ERM_KTP_Resnet
+from architecture.asu_deity import ASUDeiTArchitecture  
 
 from approx_algo.gradient_ascent import Gradient_Ascent
 from approx_algo.module import Module
@@ -183,6 +184,8 @@ def main():
             alpha_ratio=getattr(args, 'alpha_ratio', 0.1),
             device=device
         )
+    elif 'asu_deit' in args.model_name:
+        model = ASUDeiTArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
     elif 'resnet' in args.model_name:
         model = ResNetArchitecture(model_name=args.model_name, num_classes=num_classes, pretrained=args.pretrained, device=device)
     elif 'deit' in args.model_name:

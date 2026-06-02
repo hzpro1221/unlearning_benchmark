@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from architecture.based_model import BaseArchitecture
+
 class LearnableMaskLayer(nn.Module):
     def __init__(self, feature_dim, num_classes, alpha_ratio=0.1):
         super(LearnableMaskLayer, self).__init__()

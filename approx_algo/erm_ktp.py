@@ -201,14 +201,14 @@ class ERM_KTP(Gradient_Ascent):
                     f_T_conv = model_T.featurizer.feature_extractor(images)
                     f_T_pooled = torch.flatten(model_T.featurizer.avgpool(f_T_conv), 1)
                 
-                # student forward: g(x; theta_S) * ¯Gc
+                # student forward: g(x; theta_S) * -Gc
                 g_S_conv = model_S.featurizer.feature_extractor(images)
                 
                 g_S_masked = model_S.featurizer.lmask.channel_express(g_S_conv, self.forget_classes)
                 
                 g_S_pooled = torch.flatten(model_S.featurizer.avgpool(g_S_masked), 1)
                 
-                # mse loss: MSE(f(x), g(x) * ¯Gc)
+                # mse loss: MSE(f(x), g(x) * -Gc)
                 loss_conv = F.mse_loss(g_S_masked, f_T_conv.detach())
                 loss_pool = F.mse_loss(g_S_pooled, f_T_pooled.detach())
                 
