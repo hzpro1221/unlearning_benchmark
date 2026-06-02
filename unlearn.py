@@ -1,3 +1,4 @@
+# main script for the unlearning pipeline
 import os
 import argparse
 import random
@@ -42,6 +43,7 @@ from approx_algo.sg_unlearn import SG_Unlearning
 from approx_algo.boundary_expanding import Boundary_Expanding 
 from approx_algo.erm_ktp import ERM_KTP 
 from approx_algo.asu import ASU  
+from approx_algo.salun import SalUn 
 
 class ApplyTransform(Dataset):
     def __init__(self, subset, transform=None):
@@ -299,6 +301,11 @@ def main():
             **algo_kwargs,
             tau=getattr(args, 'tau', 5.0),
             support_weight=getattr(args, 'support_weight', 1.0)
+        )
+    elif unlearn_algo == 'salun':  
+        algo_wrapper = SalUn(
+            **algo_kwargs,
+            alpha=getattr(args, 'alpha', 1.0) 
         )
     elif unlearn_algo in ['module', 'module_unlearn_algo']:
         algo_wrapper = Module(
