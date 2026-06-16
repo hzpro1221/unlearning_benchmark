@@ -28,7 +28,7 @@ gamma: 0.5
 eta: 0.5
 k_u: 4
 
-epochs: 5000
+epochs: 400
 batch_size: 32
 lr: 2.0e-4
 fa_threshold: 0.70
