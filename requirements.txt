@@ -1,6 +1,4 @@
 wandb
-cvxpy
-cvxpylayers
 Pillow
 numpy
 PyYAML

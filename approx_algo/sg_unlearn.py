@@ -3,8 +3,6 @@ import time
 import torch
 import torch.nn as nn
 import wandb
-import cvxpy as cp
-from cvxpylayers.torch import CvxpyLayer
 from approx_algo.gradient_ascent import Gradient_Ascent
 
 class SG_Unlearning(Gradient_Ascent):
@@ -39,31 +37,7 @@ class SG_Unlearning(Gradient_Ascent):
             device=device
         )
         self.alpha = alpha
-        
-        # Cache DO layers to avoid recompilation overhead for identical batch sizes
-        self.do_layers = {} 
         self.proxy_loss_M = nn.BCEWithLogitsLoss()
-
-    def _get_auditor_layer(self, batch_size, logit_dim):
-        if batch_size in self.do_layers:
-            return self.do_layers[batch_size]
-            
-        X_param = cp.Parameter((batch_size, logit_dim))
-        Y_param = cp.Parameter((batch_size, 1))
-        theta_a = cp.Variable((logit_dim, 1))
-        
-        # Use strictly convex L2-regularized Ridge regression to guarantee KKT conditions.
-        # This provides a stable, invertible Hessian for the exact IFT calculation.
-        lam = 1e-3
-        objective = cp.Minimize(
-            cp.sum_squares(X_param @ theta_a - Y_param) + lam * cp.sum_squares(theta_a)
-        )
-        problem = cp.Problem(objective)
-        
-        layer = CvxpyLayer(problem, parameters=[X_param, Y_param], variables=[theta_a])
-        self.do_layers[batch_size] = layer
-        
-        return layer
 
     def unlearn(self, fa_threshold, ckpt_path):
         self.model.train()
@@ -78,7 +52,6 @@ class SG_Unlearning(Gradient_Ascent):
             unseen_iter = iter(self.unseen_loader)
             
             for forget_batch in self.forget_loader:
-                # --- STAGE 1: Retain Set Update ---
                 try:
                     retain_batch = next(retain_iter)
                 except StopIteration:
@@ -96,7 +69,6 @@ class SG_Unlearning(Gradient_Ascent):
                 self.optimizer.step() 
                 total_retain_loss += loss_r.item()
 
-                # --- STAGE 2: Construct Auditing Set ---
                 images_f = forget_batch[0].to(self.device)
                 
                 try:
@@ -109,39 +81,38 @@ class SG_Unlearning(Gradient_Ascent):
                 logits_f, _ = self.model.forward_with_grad(images_f)
                 logits_u, _ = self.model.forward_with_grad(images_u)
                 
-                # Labels: 1 for forget (member), 0 for unseen (non-member)
                 X_train = torch.cat([logits_f, logits_u], dim=0)
                 Y_train = torch.cat([
                     torch.ones(logits_f.size(0), 1), 
                     torch.zeros(logits_u.size(0), 1)
                 ], dim=0).to(self.device)
 
-                # --- STAGE 3: Differentiable Optimization ---
-                auditor_layer = self._get_auditor_layer(X_train.size(0), X_train.size(1))
+                lam = 1e-3
+                logit_dim = X_train.size(1)
+                I = torch.eye(logit_dim, device=self.device)
                 
-                # Solves for optimal auditor weights (forward) and builds IFT pathway (backward)
-                theta_a_opt, = auditor_layer(X_train, Y_train)
+                # (X^T X + \lambda I) \theta_a = X^T Y
+                A = X_train.t() @ X_train + lam * I
+                B = X_train.t() @ Y_train
+                
+                theta_a_opt = torch.linalg.solve(A, B)
 
-                # --- STAGE 4: Update via Proxy M ---
                 self.optimizer.zero_grad()
                 
                 preds_f = logits_f @ theta_a_opt
                 preds_u = logits_u @ theta_a_opt
                 
-                # Target utility: fool auditor into predicting 0 (unseen) for both sets
                 adv_labels_f = torch.zeros_like(preds_f)
                 adv_labels_u = torch.zeros_like(preds_u)
                 
                 loss_M = self.proxy_loss_M(preds_f, adv_labels_f) + self.proxy_loss_M(preds_u, adv_labels_u)
                 
-                # Backprop traces through cvxpylayer (IFT matrix inversion) directly into target model weights
                 scaled_loss_M = self.alpha * loss_M
                 scaled_loss_M.backward()
                 
                 self.optimizer.step() 
                 total_adv_loss += loss_M.item()
                 
-            # --- EVALUATION & LOGGING ---
             avg_retain_loss = total_retain_loss / len(self.forget_loader)
             avg_adv_loss = total_adv_loss / len(self.forget_loader)
             
