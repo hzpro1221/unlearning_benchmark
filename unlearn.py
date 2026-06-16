@@ -86,10 +86,14 @@ def main():
     with open(cmd_args.config, 'r') as f:
         yaml_config = yaml.safe_load(f)
     args = argparse.Namespace(**yaml_config)
+    
     yaml_filename = os.path.splitext(os.path.basename(cmd_args.config))[0]
+    
+    clean_config_path = os.path.normpath(cmd_args.config)
+    config_no_ext = os.path.splitext(clean_config_path)[0]
 
     if not hasattr(args, 'output_dir'):
-        args.output_dir = f'checkpoint/unlearn/{yaml_filename}'
+        args.output_dir = os.path.join('checkpoint', config_no_ext)
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -98,6 +102,7 @@ def main():
     print("\n" + "="*40)
     print(f"[*] initializing unlearning pipeline")
     print(f"[*] config: {cmd_args.config}")
+    print(f"[*] output_dir: {args.output_dir}")
     print(f"[*] device: {device}")
     
     unlearn_algo = getattr(args, 'unlearn_algo', 'finetune').lower()
@@ -234,6 +239,7 @@ def main():
             model_name=args.model_name, 
             num_classes=num_classes, 
             pretrained=False,
+            moe_layers=getattr(args, 'moe_layers', None),  
             num_experts=args.num_experts,
             expert_depth=args.expert_depth,
             expert_hidden_ratio=args.expert_hidden_ratio,

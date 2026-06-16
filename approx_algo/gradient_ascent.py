@@ -1,5 +1,4 @@
 import os
-import time
 import torch
 import wandb
 
@@ -44,11 +43,9 @@ class Gradient_Ascent:
         
     def learn(self, ckpt_path):
         self.model.train()
-        total_train_time = 0.0
         
         for epoch in range(self.num_epoch):
             total_loss = 0.0
-            epoch_start_time = time.time()
             
             for batch in self.train_loader:
                 images = batch[0].to(self.device)
@@ -62,15 +59,12 @@ class Gradient_Ascent:
                 self.optimizer.step()
                 total_loss += loss.item()
                 
-            epoch_train_time = time.time() - epoch_start_time
-            total_train_time += epoch_train_time
-                
             avg_loss = total_loss / len(self.train_loader)
             fa_score, ra_score, ta_score, mia_score = self.evaluate()
 
             print(f"epoch [{epoch+1}/{self.num_epoch}] | loss: {avg_loss:.4f} | "
                   f"ra: {ra_score*100:.2f}% | fa: {fa_score*100:.2f}% | "
-                  f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f} | time: {epoch_train_time:.2f}s")
+                  f"ta: {ta_score*100:.2f}% | mia: {mia_score:.4f}")
             
             wandb.log({
                 "epoch": epoch + 1,
@@ -85,19 +79,15 @@ class Gradient_Ascent:
 
         peak_memory_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
         wandb.log({
-            "total_train_time_sec": total_train_time,
             "peak_memory_gb": peak_memory_gb
         })
 
         torch.save(self.model.state_dict(), f"{ckpt_path}.pt")
-        return total_train_time
 
     def unlearn(self, fa_threshold, ckpt_path):
         self.model.train()
-        total_unlearn_time = 0.0
         
         for epoch in range(self.num_epoch):
-            epoch_start_time = time.time()
             total_loss = 0.0
             
             for batch in self.forget_loader:
@@ -117,13 +107,11 @@ class Gradient_Ascent:
                 total_loss += loss.item()
                 
             avg_loss = total_loss / len(self.forget_loader)
-            epoch_time = time.time() - epoch_start_time
-            total_unlearn_time += epoch_time
             
             print(f"[*] evaluating epoch {epoch+1}...")
             fa_score, ra_score, ta_score, mia_score = self.evaluate()
             
-            print(f"--> Epoch [{epoch+1}/{self.num_epoch}] | Time: {epoch_time:.2f}s | Loss: {avg_loss:.4f}")
+            print(f"--> Epoch [{epoch+1}/{self.num_epoch}] | Loss: {avg_loss:.4f}")
             print(f"--> Metrics: RA: {ra_score*100:.2f}% | FA: {fa_score*100:.2f}% | TA: {ta_score*100:.2f}% | MIA: {mia_score:.4f}")
             print("-" * 40)
             
@@ -144,17 +132,14 @@ class Gradient_Ascent:
     
         peak_memory_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
         wandb.log({
-            "total_train_time_sec": total_unlearn_time,
             "peak_memory_gb": peak_memory_gb
         })
 
         torch.save(self.model.state_dict(), f"{ckpt_path}.pt")
-        return total_unlearn_time
 
     def evaluate(self):
         fa_score = forget_acc(self.model, self.forget_test_loader, self.device)
         ra_score = retain_acc(self.model, self.retain_test_loader, self.device)
         ta_score = test_acc(self.model, self.test_loader, self.device)
         mia_score = mia(self.model, self.unseen_loader, self.forget_test_loader, self.device)
-        
         return fa_score, ra_score, ta_score, mia_score

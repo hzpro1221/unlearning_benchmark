@@ -79,18 +79,27 @@ def main():
         yaml_config = yaml.safe_load(f)
         
     args = argparse.Namespace(**yaml_config)
+    
     yaml_filename = os.path.splitext(os.path.basename(cmd_args.config))[0]
+    
+    clean_config_path = os.path.normpath(cmd_args.config)
+    config_no_ext = os.path.splitext(clean_config_path)[0]
 
     if not hasattr(args, 'output_dir'):
-        args.output_dir = f'checkpoint/learn/{yaml_filename}'
+        args.output_dir = os.path.join('checkpoint', config_no_ext)
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    print("\n" + "="*40)
+    print(f"[*] initializing learning pipeline")
+    print(f"[*] config: {cmd_args.config}")
+    print(f"[*] output_dir: {args.output_dir}")
+    print(f"[*] device: {device}")
 
     unlearn_setting = getattr(args, 'unlearn_setting', 'random')
 
-    # fail fast constraint for erm-ktp
     if 'erm_ktp' in getattr(args, 'model_name', '').lower() and unlearn_setting != 'class':
         raise ValueError(
             f"\n[ERROR] Mathematical Constraint Violated:\n"
@@ -123,7 +132,6 @@ def main():
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
-    # primary split
     total_size = len(full_dataset)
     train_size = int(0.8 * total_size)
     test_size = int(0.1 * total_size)
@@ -134,7 +142,6 @@ def main():
         full_dataset, [train_size, test_size, unseen_size], generator=generator
     )
 
-    # secondary split 
     if unlearn_setting == 'random':
         forget_size = int(getattr(args, 'forget_ratio', 0.1) * train_size)
         forget_subset, retain_subset = random_split(
@@ -164,7 +171,6 @@ def main():
     else:
         raise ValueError("unlearn_setting must be 'random', 'class', or 'domain'")
 
-    # prepare dataloaders
     train_loader = DataLoader(ApplyTransform(train_subset, get_train_transform()), batch_size=args.batch_size, shuffle=True, num_workers=4)
     forget_train_loader = DataLoader(ApplyTransform(forget_subset, get_train_transform()), batch_size=args.batch_size, shuffle=True, num_workers=4)
     retain_train_loader = DataLoader(ApplyTransform(retain_subset, get_train_transform()), batch_size=args.batch_size, shuffle=True, num_workers=4)
@@ -174,7 +180,6 @@ def main():
     test_loader = DataLoader(ApplyTransform(final_test_subset, get_test_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
     unseen_loader = DataLoader(ApplyTransform(unseen_subset, get_unseen_transform()), batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    # model initialization
     if 'erm_ktp_resnet' in args.model_name:
         backbone_name = args.model_name.replace('erm_ktp_', '')
         model = ERM_KTP_Resnet(
@@ -195,6 +200,7 @@ def main():
             model_name=args.model_name, 
             num_classes=num_classes, 
             pretrained=args.pretrained,
+            moe_layers=getattr(args, 'moe_layers', None),
             num_experts=args.num_experts,
             expert_depth=args.expert_depth,
             expert_hidden_ratio=args.expert_hidden_ratio,
@@ -209,7 +215,6 @@ def main():
     criteria = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    # unified arguments for wrappers
     algo_kwargs = {
         "model": model,
         "train_loader": train_loader,
@@ -234,7 +239,6 @@ def main():
             lambda_sparse=getattr(args, 'lambda_sparse', 1.0),
             lambda_balance=getattr(args, 'lambda_balance', 1.0),
             lambda_div=getattr(args, 'lambda_div', 1.0),
-            # dummy unlearn to prevent error
             alpha=1.0, beta=1.0, gamma=1.0, eta=1.0, k_u=2 
         )
         ema_alpha = getattr(args, 'ema_alpha', 0.9)
@@ -252,7 +256,6 @@ def main():
         )
         algo_wrapper.learn(ckpt_path=ckpt_prefix)
     else:
-        # standard training loop 
         algo_wrapper = Gradient_Ascent(**algo_kwargs)
         algo_wrapper.learn(ckpt_path=ckpt_prefix)
 
