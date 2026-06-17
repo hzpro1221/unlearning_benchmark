@@ -29,7 +29,7 @@ k_u: 4
 
 epochs: 500
 batch_size: 32
-lr: 4.0e-4
+lr: 2.0e-4
 fa_threshold: 0.70
 seed: 42
 
