@@ -15,7 +15,7 @@ def download_cifar100_hf(data_dir):
     
     # fetch the official cifar100 dataset from hugging face
     print("Fetching dataset from hugging face hub (cifar100)...")
-    dataset = load_dataset("cifar100")
+    dataset = load_dataset("uoft-cs/cifar100")
     
     # cifar-100 has two label levels: 'coarse_label' (20 superclasses) and 'fine_label' (100 classes).
     # we will organize the folders by the 100 fine classes.

@@ -3,3 +3,5 @@ Pillow
 numpy
 PyYAML
 timm
+datasets 
+pillow
