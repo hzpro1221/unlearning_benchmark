@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 from approx_algo.gradient_ascent import Gradient_Ascent
+import inspect
 
 from metric.fa import forget_acc
 
@@ -397,7 +398,10 @@ class Module(Gradient_Ascent):
         
         closest_fa_score = float('inf') 
 
-        print(f"[*] Starting unlearning with selection: {self.selection_option}, update_scope: {self.update_scope}")
+        if (self.selection_option != "diff"):
+            print(f"[*] Starting unlearning with selection: {self.selection_option}, update_scope: {self.update_scope}")
+        else:
+            print(f"[*] Starting unlearning with selection: {self.selection_option}, alpha: {self.alpha} ,update_scope: {self.update_scope}")
 
         for epoch in range(self.num_epoch):
             epoch_start_time = time.time()
@@ -440,10 +444,36 @@ class Module(Gradient_Ascent):
 
             # apply update scope.
             self._apply_update_scope(selected_experts_per_layer, moe_layers)
+
+            # re-init optimizer.
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            opt_class = type(self.optimizer)
+            valid_kwargs = inspect.signature(opt_class.__init__).parameters.keys()
+            filtered_defaults = {k: v for k, v in self.optimizer.defaults.items() if k in valid_kwargs}
+            self.optimizer = opt_class(trainable_params, **filtered_defaults)
+            
+            # ================= [DEBUG BLOCK 1: Setup & Tracking] =================
+            print("\n" + "="*60)
+            print(f"[DEBUG] EPOCH {epoch+1} SETUP")
+            print(f"[DEBUG] Optimizer params: {filtered_defaults}")
+            for l_idx, exp_list in enumerate(selected_experts_per_layer):
+                print(f"[DEBUG] Layer {l_idx} selected experts: {exp_list}")
+            
+            # Lấy ngẫu nhiên 1 tham số của Expert và 1 của Head để theo dõi
+            sample_expert_param = None
+            for m in moe_layers:
+                if len(m.allowed_experts) > 0:
+                    first_expert = m.experts[m.allowed_experts[0]]
+                    # Lấy tham số weight của layer Linear đầu tiên trong expert
+                    sample_expert_param = next(first_expert.parameters())
+                    break
+            sample_head_param = next(self.model.classifier_head.parameters())
+            print("="*60)
+            # =====================================================================
             
             total_params = sum(p.numel() for p in self.model.parameters())
-            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            print(f"[*] Update Scope: {self.update_scope} | Trainable Params: {trainable_params:,} / {total_params:,} ({(trainable_params / total_params) * 100:.2f}%)")
+            trainable_params_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f"[*] Update Scope: {self.update_scope} | Trainable Params: {trainable_params_count:,} / {total_params:,} ({(trainable_params_count / total_params) * 100:.2f}%)")
 
             # filter retain set.
             epoch_retain_loader = self._create_filtered_retain_loader(self.retain_loader, selected_experts_per_layer, moe_layers)
@@ -458,6 +488,13 @@ class Module(Gradient_Ascent):
                 retain_iter = None
             
             for step, forget_batch in enumerate(self.forget_loader):
+                
+                # ================= [DEBUG BLOCK 2: Lưu Weight cũ] =================
+                if step == 0:
+                    expert_val_before = sample_expert_param.clone().detach() if sample_expert_param is not None else None
+                    head_val_before = sample_head_param.clone().detach()
+                # ==================================================================
+                
                 images_f = forget_batch[0].to(self.device)
                 labels_f = forget_batch[1].to(self.device)
                 
@@ -488,10 +525,26 @@ class Module(Gradient_Ascent):
 
                 total_loss = loss_forget + (self.beta * loss_retain) + (self.gamma * loss_distill) + (self.eta * loss_sep)
                 total_loss.backward()
+                
+                # ================= [DEBUG BLOCK 3: Check Gradient Norm] =================
+                if step == 0:
+                    exp_grad = sample_expert_param.grad.norm().item() if (sample_expert_param is not None and sample_expert_param.grad is not None) else 0.0
+                    head_grad = sample_head_param.grad.norm().item() if sample_head_param.grad is not None else 0.0
+                    print(f"[DEBUG] Step 0 - GRADIENT NORM  | Expert: {exp_grad:.8f} | Head: {head_grad:.8f}")
+                # ========================================================================
+
                 self.optimizer.step()
                 
+                # ================= [DEBUG BLOCK 4: Check Weight Diff] =================
+                if step == 0:
+                    exp_diff = (sample_expert_param - expert_val_before).norm().item() if expert_val_before is not None else 0.0
+                    head_diff = (sample_head_param - head_val_before).norm().item()
+                    print(f"[DEBUG] Step 0 - WEIGHT UPDATED | Expert Diff: {exp_diff:.10f} | Head Diff: {head_diff:.10f}")
+                    print("="*60 + "\n")
+                # ======================================================================
+                
                 total_loss_accum += total_loss.item()
-                total_unlearn_steps += 1  
+                total_unlearn_steps += 1
                 
             avg_loss = total_loss_accum / len(self.forget_loader)
             epoch_time = time.time() - epoch_start_time

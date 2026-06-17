@@ -239,7 +239,11 @@ def main():
             lambda_sparse=getattr(args, 'lambda_sparse', 1.0),
             lambda_balance=getattr(args, 'lambda_balance', 1.0),
             lambda_div=getattr(args, 'lambda_div', 1.0),
-            alpha=1.0, beta=1.0, gamma=1.0, eta=1.0, k_u=2 
+            alpha=1.0, 
+            beta=1.0, 
+            gamma=1.0, 
+            eta=1.0, 
+            k_u=2 
         )
         ema_alpha = getattr(args, 'ema_alpha', 0.9)
         algo_wrapper.learn(ckpt_path=ckpt_prefix, ema_alpha=ema_alpha)

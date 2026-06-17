@@ -323,7 +323,9 @@ def main():
             beta=getattr(args, 'beta', 1.0),
             gamma=getattr(args, 'gamma', 1.0),
             eta=getattr(args, 'eta', 1.0),
-            k_u=getattr(args, 'k_u', 2)
+            k_u=getattr(args, 'k_u', 2),
+            selection_option=getattr(args, 'selection_option', 'diff'),
+            update_scope=getattr(args, 'update_scope', 'selected_experts_and_head')
         )
     elif unlearn_algo == 'finetune':
         algo_wrapper = Finetune(**algo_kwargs)

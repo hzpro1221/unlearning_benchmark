@@ -9,7 +9,7 @@ expert_depth: 2
 expert_hidden_ratio: 0.10
 gate_k: 2
 
-pretrained_model_path: # path to the checkpoint
+pretrained_model_path: "checkpoint/config/ablation/expert_selection_rules/learn/expert_selection_rules/expert_selection_rules_epoch_100.pt"
 
 unlearn_algo: "module_unlearn_algo"
 
@@ -27,13 +27,13 @@ gamma: 0.5
 eta: 0.5
 k_u: 4
 
-epochs: 400
+epochs: 500
 batch_size: 32
-lr: 2.0e-4
+lr: 4.0e-4
 fa_threshold: 0.70
 seed: 42
 
 # ablation config
 selection_option: "diff"                 
 alpha: 0.3
-update_scope: "selected_experts_and_head" 
+update_scope: "selected_experts_only" 
