@@ -5,3 +5,4 @@ PyYAML
 timm
 datasets 
 pillow
+scikit-learn
