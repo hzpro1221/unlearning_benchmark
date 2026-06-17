@@ -247,7 +247,6 @@ def main():
             device=device
         )
         model._set_grad_mode("unlearning")
-        model = torch.compile(model)
     else:
         raise ValueError(f"Unsupported model: {args.model_name}")
 
