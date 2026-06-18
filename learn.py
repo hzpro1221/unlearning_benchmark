@@ -82,11 +82,19 @@ def main():
     
     yaml_filename = os.path.splitext(os.path.basename(cmd_args.config))[0]
     
-    clean_config_path = os.path.normpath(cmd_args.config)
-    config_no_ext = os.path.splitext(clean_config_path)[0]
+    # handle for both Windows and Linux path.
+    normalized_path = cmd_args.config.replace('\\', '/')
+    
+    path_no_ext = os.path.splitext(normalized_path)[0]
+
+    if 'config/' in path_no_ext:
+        rel_structure = 'config/' + path_no_ext.split('config/')[-1]
+    else:
+        rel_structure = os.path.basename(path_no_ext)
+    rel_structure = os.path.normpath(rel_structure)
 
     if not hasattr(args, 'output_dir'):
-        args.output_dir = os.path.join('checkpoint', config_no_ext)
+        args.output_dir = os.path.join('checkpoint', rel_structure)
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
