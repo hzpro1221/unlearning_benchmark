@@ -15,8 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
-from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
-from timm.models.registry import register_model
+from timm.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 
 from architecture.based_model import BaseArchitecture
 
@@ -357,42 +356,34 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
 # DeiT Model Factories
 # ==============================================================================
 
-@register_model
 def deit_tiny_patch16_224(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, **kwargs)
     return _create_vision_transformer('deit_tiny_patch16_224', pretrained=pretrained, **model_kwargs)
 
-@register_model
 def deit_small_patch16_224(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, **kwargs)
     return _create_vision_transformer('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
 
-@register_model
 def deit_base_patch16_224(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
     return _create_vision_transformer('deit_base_patch16_224', pretrained=pretrained, **model_kwargs)
 
-@register_model
 def deit_base_patch16_384(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
     return _create_vision_transformer('deit_base_patch16_384', pretrained=pretrained, **model_kwargs)
 
-@register_model
 def deit_tiny_distilled_patch16_224(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, **kwargs)
     return _create_vision_transformer('deit_tiny_distilled_patch16_224', pretrained=pretrained, distilled=True, **model_kwargs)
 
-@register_model
 def deit_small_distilled_patch16_224(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, **kwargs)
     return _create_vision_transformer('deit_small_distilled_patch16_224', pretrained=pretrained, distilled=True, **model_kwargs)
 
-@register_model
 def deit_base_distilled_patch16_224(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
     return _create_vision_transformer('deit_base_distilled_patch16_224', pretrained=pretrained, distilled=True, **model_kwargs)
 
-@register_model
 def deit_base_distilled_patch16_384(pretrained=False, **kwargs):
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
     return _create_vision_transformer('deit_base_distilled_patch16_384', pretrained=pretrained, distilled=True, **model_kwargs)

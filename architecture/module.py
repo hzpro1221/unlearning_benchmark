@@ -4,7 +4,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_
+from timm.layers import PatchEmbed, Mlp, DropPath, trunc_normal_
 
 from architecture.based_model import BaseArchitecture
 
