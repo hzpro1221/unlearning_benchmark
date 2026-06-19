@@ -7,7 +7,7 @@ moe_layers: "FFFFFFFFSFSF"
 num_experts: 12
 expert_depth: 2
 expert_hidden_ratio: 0.10
-gate_k: 2
+gate_k: 4
 
 pretrained_model_path: # path to the checkpoint
 
